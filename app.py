@@ -740,14 +740,15 @@ def run_remote(proc, shells, host, item_id, command):
     token = f"DEPLOY_DONE_{item_id}_{count}"
     marker = f"__{token}__"
     script = (
-        f"cat > /tmp/{token}.cmd <<'END_{token}'\n"
+        f"cat > \"/tmp/{token}.cmd\" <<'END_{token}'\n"
         f"{command}\n"
         f"END_{token}\n"
-        f"source /tmp/{token}.cmd > /tmp/{token}.out 2>&1\n"
+        f"source \"/tmp/{token}.cmd\" > \"/tmp/{token}.out\" 2>&1\n"
         f"export DEPLOY_PREV_STATUS=$?\n"
-        f"cat /tmp/{token}.out\n"
-        f"export DEPLOY_PREV_OUTPUT=\"$(cat /tmp/{token}.out)\"\n"
+        f"cat \"/tmp/{token}.out\"\n"
+        f"export DEPLOY_PREV_OUTPUT=\"$(cat \"/tmp/{token}.out\")\"\n"
         f"export DEPLOY_OUTPUT_{count}=\"$DEPLOY_PREV_OUTPUT\"\n"
+        f"rm -f \"/tmp/{token}.cmd\" \"/tmp/{token}.out\"\n"
         f"printf '%s\\n' \"{marker} $DEPLOY_PREV_STATUS\"\n"
     )
     remember_proc(proc)
