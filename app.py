@@ -21,7 +21,6 @@ DB_PATH = DATA / "app.sqlite"
 PUBLIC = ROOT / "public"
 
 _lock = threading.Lock()
-_line_slots = threading.Semaphore(6)
 _current = {"run_id": None, "proc": None, "procs": [], "cancel": False}
 
 
@@ -44,21 +43,91 @@ def now():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def max_parallel_lines():
+    import json
+    path = DATA / "app.json"
+    if not path.is_file():
+        return 6
+    try:
+        value = int(json.loads(path.read_text(encoding="utf-8")).get("max_parallel_lines") or 6)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return 6
+    return max(1, value)
+
+
+
+
+def load_mysql_config():
+    import json
+    config_path = DATA / "mysql.json"
+    if not config_path.is_file():
+        raise RuntimeError("缺少 data/mysql.json")
+    return json.loads(config_path.read_text(encoding="utf-8"))
+
+
+class MySQLConn:
+    def __init__(self, raw):
+        self.raw = raw
+        self.cur = raw.cursor()
+
+    def execute(self, sql, args=()):
+        self.cur.execute(sql.replace("?", "%s"), args or ())
+        return self
+
+    def executescript(self, script):
+        for statement in script.split(";"):
+            if statement.strip():
+                self.execute(statement)
+        return self
+
+    def fetchone(self):
+        return self.cur.fetchone()
+
+    def fetchall(self):
+        return self.cur.fetchall()
+
+    @property
+    def lastrowid(self):
+        return self.cur.lastrowid
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type:
+                self.raw.rollback()
+            else:
+                self.raw.commit()
+        finally:
+            self.raw.close()
+        return False
+
+
 def connect():
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    import sys
+    vendor = ROOT / "vendor"
+    if vendor.exists():
+        sys.path.insert(0, str(vendor))
+    import pymysql
+    from pymysql.cursors import DictCursor
+    cfg = load_mysql_config()
+    raw = pymysql.connect(
+        host=cfg["host"],
+        port=int(cfg.get("port") or 3306),
+        user=cfg["user"],
+        password=cfg["password"],
+        database=cfg["database"],
+        charset="utf8mb4",
+        autocommit=False,
+        cursorclass=DictCursor,
+    )
+    return MySQLConn(raw)
 
 
 def assign_legacy_steps(conn):
-    columns = [row[1] for row in conn.execute("PRAGMA table_info(steps)")]
-    if "note" not in columns:
-        conn.execute("ALTER TABLE steps ADD COLUMN note TEXT NOT NULL DEFAULT ''")
-    columns = [row[1] for row in conn.execute("PRAGMA table_info(steps)")]
-    if "host_id" not in columns:
-        conn.execute("ALTER TABLE steps ADD COLUMN host_id INTEGER")
-    legacy = [dict(row) for row in conn.execute("SELECT * FROM steps WHERE host_id IS NULL ORDER BY position, id")]
-    hosts = [dict(row) for row in conn.execute("SELECT id FROM hosts ORDER BY id")]
+    legacy = [dict(row) for row in conn.execute("SELECT * FROM steps WHERE host_id IS NULL ORDER BY position, id").fetchall()]
+    hosts = [dict(row) for row in conn.execute("SELECT id FROM hosts ORDER BY id").fetchall()]
     if not legacy or not hosts:
         return
     for host in hosts:
@@ -71,7 +140,7 @@ def assign_legacy_steps(conn):
                 INSERT INTO steps (plan_id, host_id, position, kind, command, local_path, remote_path, note)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (step["plan_id"], host["id"], step["position"], step["kind"], step["command"], step["local_path"], step["remote_path"], step["note"] if "note" in step.keys() else ""),
+                (step["plan_id"], host["id"], step["position"], step["kind"], step["command"], step["local_path"], step["remote_path"], step.get("note") or ""),
             )
     conn.execute("DELETE FROM steps WHERE host_id IS NULL")
 
@@ -79,72 +148,107 @@ def assign_legacy_steps(conn):
 def init_db():
     DATA.mkdir(exist_ok=True)
     with connect() as conn:
-        columns = [row[1] for row in conn.execute("PRAGMA table_info(hosts)")]
-        if "password" not in columns:
-            conn.execute("ALTER TABLE hosts ADD COLUMN password TEXT NOT NULL DEFAULT ''")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS hosts (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              name TEXT NOT NULL,
-              ip TEXT NOT NULL,
-              port INTEGER NOT NULL DEFAULT 22,
-              username TEXT NOT NULL,
-              identity_file TEXT NOT NULL DEFAULT '',
-              password TEXT NOT NULL DEFAULT '',
-              created_at TEXT NOT NULL
-            );
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              name VARCHAR(255) NOT NULL,
+              ip VARCHAR(255) NOT NULL,
+              port INT NOT NULL DEFAULT 22,
+              username VARCHAR(255) NOT NULL,
+              identity_file VARCHAR(1024) NOT NULL DEFAULT '',
+              password VARCHAR(1024) NOT NULL DEFAULT '',
+              created_at VARCHAR(32) NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             CREATE TABLE IF NOT EXISTS plans (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              name TEXT NOT NULL,
-              created_at TEXT NOT NULL
-            );
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              name VARCHAR(255) NOT NULL,
+              created_at VARCHAR(32) NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             CREATE TABLE IF NOT EXISTS steps (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              plan_id INTEGER NOT NULL,
-              position INTEGER NOT NULL,
-              kind TEXT NOT NULL,
-              command TEXT NOT NULL DEFAULT '',
-              local_path TEXT NOT NULL DEFAULT '',
-              remote_path TEXT NOT NULL DEFAULT ''
-            );
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              plan_id BIGINT NOT NULL,
+              host_id BIGINT NULL,
+              position INT NOT NULL,
+              kind VARCHAR(32) NOT NULL,
+              command MEDIUMTEXT NOT NULL,
+              local_path VARCHAR(1024) NOT NULL DEFAULT '',
+              remote_path VARCHAR(1024) NOT NULL DEFAULT '',
+              note VARCHAR(255) NOT NULL DEFAULT ''
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             CREATE TABLE IF NOT EXISTS runs (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              plan_id INTEGER,
-              plan_name TEXT NOT NULL,
-              status TEXT NOT NULL,
-              message TEXT NOT NULL DEFAULT '',
-              created_at TEXT NOT NULL,
-              finished_at TEXT
-            );
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              plan_id BIGINT NULL,
+              plan_name VARCHAR(255) NOT NULL,
+              status VARCHAR(32) NOT NULL,
+              message TEXT NOT NULL,
+              created_at VARCHAR(32) NOT NULL,
+              finished_at VARCHAR(32) NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             CREATE TABLE IF NOT EXISTS run_steps (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              run_id INTEGER NOT NULL,
-              position INTEGER NOT NULL,
-              host_id INTEGER,
-              host_label TEXT NOT NULL,
-              step_id INTEGER,
-              kind TEXT NOT NULL,
-              preview TEXT NOT NULL,
-              status TEXT NOT NULL,
-              output TEXT NOT NULL DEFAULT '',
-              exit_code INTEGER,
-              started_at TEXT,
-              finished_at TEXT
-            );
-            """
-        )
-        conn.execute(
-            """
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              run_id BIGINT NOT NULL,
+              position INT NOT NULL,
+              host_id BIGINT NULL,
+              host_label VARCHAR(255) NOT NULL,
+              step_id BIGINT NULL,
+              kind VARCHAR(32) NOT NULL,
+              preview MEDIUMTEXT NOT NULL,
+              status VARCHAR(32) NOT NULL,
+              output MEDIUMTEXT NOT NULL,
+              exit_code INT NULL,
+              started_at VARCHAR(32) NULL,
+              finished_at VARCHAR(32) NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             CREATE TABLE IF NOT EXISTS line_flags (
-              plan_id INTEGER NOT NULL,
-              host_id INTEGER NOT NULL,
-              disabled INTEGER NOT NULL DEFAULT 0,
+              plan_id BIGINT NOT NULL,
+              host_id BIGINT NOT NULL,
+              disabled TINYINT NOT NULL DEFAULT 0,
               PRIMARY KEY (plan_id, host_id)
-            )
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """
         )
         assign_legacy_steps(conn)
+        migrate_sqlite_if_needed(conn)
+        has_force = conn.execute(
+            "SELECT COUNT(*) AS n FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='line_flags' AND COLUMN_NAME='force_run'"
+        ).fetchone()["n"]
+        if not has_force:
+            conn.execute("ALTER TABLE line_flags ADD COLUMN force_run TINYINT NOT NULL DEFAULT 0")
+
+
+def migrate_sqlite_if_needed(conn):
+    import sqlite3
+    if not DB_PATH.is_file():
+        return
+    if conn.execute("SELECT COUNT(*) AS n FROM hosts").fetchone()["n"]:
+        return
+    src = sqlite3.connect(DB_PATH)
+    src.row_factory = sqlite3.Row
+    tables = [
+        ("hosts", "id, name, ip, port, username, identity_file, password, created_at"),
+        ("plans", "id, name, created_at"),
+        ("steps", "id, plan_id, host_id, position, kind, command, local_path, remote_path, note"),
+        ("runs", "id, plan_id, plan_name, status, message, created_at, finished_at"),
+        ("run_steps", "id, run_id, position, host_id, host_label, step_id, kind, preview, status, output, exit_code, started_at, finished_at"),
+        ("line_flags", "plan_id, host_id, disabled"),
+    ]
+    for table, columns in tables:
+        names = [name.strip() for name in columns.split(",")]
+        placeholders = ", ".join(["?"] * len(names))
+        try:
+            records = src.execute(f"SELECT {columns} FROM {table}").fetchall()
+        except sqlite3.OperationalError:
+            continue
+        for record in records:
+            conn.execute(
+                f"INSERT INTO {table} ({columns}) VALUES ({placeholders})",
+                tuple(record[name] if record[name] is not None else ("" if name in ("message", "output", "note", "command", "preview") else None) for name in names),
+            )
+        if "id" in names and records:
+            max_id = max(record["id"] for record in records)
+            conn.execute(f"ALTER TABLE {table} AUTO_INCREMENT = {int(max_id) + 1}")
+    src.close()
 
 
 def rows(conn, sql, args=()):
@@ -310,7 +414,7 @@ def append_output(step_id, text):
         return
     with _lock, connect() as conn:
         conn.execute(
-            "UPDATE run_steps SET output = output || ? WHERE id=?",
+            "UPDATE run_steps SET output = CONCAT(IFNULL(output, ''), ?) WHERE id=?",
             (text, step_id),
         )
 
@@ -594,9 +698,12 @@ def execute_run(run_id):
         groups[host_id].append(item)
     failure_messages = []
     lock = threading.Lock()
+    limit = max_parallel_lines()
+    print(f"本次同时执行上限：{limit}", flush=True)
+    slots = threading.Semaphore(limit)
 
     def worker(host_items):
-        with _line_slots:
+        with slots:
             if _current["cancel"]:
                 return
             try:
@@ -701,7 +808,7 @@ def start_run(plan_id, host_ids, from_step_id=None):
         plan = conn.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
         if not plan:
             raise ValueError("命令方案不存在")
-        disabled = {row["host_id"] for row in conn.execute("SELECT host_id FROM line_flags WHERE plan_id=? AND disabled=1", (plan_id,))}
+        disabled = {row["host_id"] for row in conn.execute("SELECT host_id FROM line_flags WHERE plan_id=? AND disabled=1", (plan_id,)).fetchall()}
         hosts = []
         for host_id in host_ids:
             if host_id in disabled:
@@ -713,13 +820,13 @@ def start_run(plan_id, host_ids, from_step_id=None):
         if not hosts:
             raise ValueError("没有可执行的线，灰色禁用的线不会执行")
         cur = conn.execute(
-            "INSERT INTO runs (plan_id, plan_name, status, created_at) VALUES (?, ?, 'running', ?)",
+            "INSERT INTO runs (plan_id, plan_name, status, message, created_at) VALUES (?, ?, 'running', '', ?)",
             (plan_id, plan["name"], now()),
         )
         run_id = cur.lastrowid
         position = 1
         for host in hosts:
-            steps = [dict(row) for row in conn.execute("SELECT * FROM steps WHERE plan_id=? AND host_id=? ORDER BY position, id", (plan_id, host["id"]))]
+            steps = [dict(row) for row in conn.execute("SELECT * FROM steps WHERE plan_id=? AND host_id=? ORDER BY position, id", (plan_id, host["id"])).fetchall()]
             if not steps:
                 raise ValueError(host["name"] + " 这条线还没有自己的命令")
             resume_at = None
@@ -728,6 +835,28 @@ def start_run(plan_id, host_ids, from_step_id=None):
                 if not matched:
                     raise ValueError("没有找到要继续的命令")
                 resume_at = matched[0]["position"]
+            force_row = conn.execute(
+                "SELECT force_run FROM line_flags WHERE plan_id=? AND host_id=?",
+                (plan_id, host["id"]),
+            ).fetchone()
+            force_run = bool(force_row and force_row.get("force_run"))
+            if not from_step_id and not force_run:
+                finished = True
+                for step in steps:
+                    prev = conn.execute(
+                        "SELECT status FROM run_steps WHERE step_id=? ORDER BY id DESC LIMIT 1",
+                        (step["id"],),
+                    ).fetchone()
+                    if not prev or prev["status"] != "success":
+                        finished = False
+                        break
+                if finished:
+                    continue
+            if force_run:
+                conn.execute(
+                    "UPDATE line_flags SET force_run=0 WHERE plan_id=? AND host_id=?",
+                    (plan_id, host["id"]),
+                )
             for step in steps:
                 preview = step["command"] or f"{step['kind']} {step['local_path']} -> {step['remote_path']}"
                 status = "pending"
@@ -735,13 +864,15 @@ def start_run(plan_id, host_ids, from_step_id=None):
                 exit_code = None
                 started = None
                 finished = None
-                if resume_at and step["position"] < resume_at:
+                prev = conn.execute(
+                    "SELECT status, output, preview FROM run_steps WHERE step_id=? ORDER BY id DESC LIMIT 1",
+                    (step["id"],),
+                ).fetchone()
+                same_command = prev and (prev["preview"] or "") == preview
+                keep_success = (not force_run) and prev and prev["status"] == "success" and same_command and not (resume_at and step["position"] >= resume_at)
+                if (resume_at and step["position"] < resume_at) or keep_success:
                     status = "success"
-                    prev = conn.execute(
-                        "SELECT output FROM run_steps WHERE step_id=? AND status='success' ORDER BY id DESC LIMIT 1",
-                        (step["id"],),
-                    ).fetchone()
-                    output = ((prev["output"] if prev and prev["output"] else "") + "\n已跳过，从失败命令继续\n").strip() + "\n"
+                    output = (prev["output"] if prev and prev["output"] else "")
                     exit_code = 0
                     started = now()
                     finished = now()
@@ -767,6 +898,9 @@ def start_run(plan_id, host_ids, from_step_id=None):
                     ),
                 )
                 position += 1
+        if position == 1:
+            conn.execute("DELETE FROM runs WHERE id=?", (run_id,))
+            raise ValueError("已完成的线不会重复执行，请先点「刷新这条线」")
     _current["run_id"] = run_id
     _current["cancel"] = False
     threading.Thread(target=execute_run, args=(run_id,), daemon=True).start()
@@ -1027,16 +1161,27 @@ class Handler(BaseHTTPRequestHandler):
     def save_line_flag(self, payload):
         plan_id = int(payload.get("planId") or 0)
         host_id = int(payload.get("hostId") or 0)
-        disabled = 1 if payload.get("disabled") else 0
         if not plan_id or not host_id:
             raise ValueError("请选择方案和目标线")
         with connect() as conn:
+            current = conn.execute(
+                "SELECT disabled, force_run FROM line_flags WHERE plan_id=? AND host_id=?",
+                (plan_id, host_id),
+            ).fetchone()
+            if "disabled" in payload:
+                disabled = 1 if payload.get("disabled") else 0
+            else:
+                disabled = current["disabled"] if current else 0
+            if "forceRun" in payload:
+                force_run = 1 if payload.get("forceRun") else 0
+            else:
+                force_run = current["force_run"] if current else 0
             conn.execute(
                 """
-                INSERT INTO line_flags (plan_id, host_id, disabled) VALUES (?, ?, ?)
-                ON CONFLICT(plan_id, host_id) DO UPDATE SET disabled=excluded.disabled
+                INSERT INTO line_flags (plan_id, host_id, disabled, force_run) VALUES (?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE disabled=VALUES(disabled), force_run=VALUES(force_run)
                 """,
-                (plan_id, host_id, disabled),
+                (plan_id, host_id, disabled, force_run),
             )
         self.send_json({"ok": True})
 

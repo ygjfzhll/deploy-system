@@ -179,6 +179,12 @@ function nodeElement(node) {
   sub.className = "sub";
   sub.textContent = node.sub || "";
   body.append(kicker, title, sub);
+  if (node.finishedAt) {
+    const pop = document.createElement("div");
+    pop.className = "node-pop";
+    pop.textContent = (node.title === "失败" ? "最近失败时间 " : "最近成功时间 ") + node.finishedAt;
+    el.append(pop);
+  }
   el.append(body);
   if (node.actions) {
     const hint = document.createElement("div");
@@ -206,6 +212,10 @@ function nodeElement(node) {
     el.append(hint, bar);
   }
   if (node.log) {
+    const pop = document.createElement("div");
+    pop.className = "node-pop";
+    pop.textContent = node.log.replace(/本次未重复执行/g, "").trim();
+    el.append(pop);
     const zoom = document.createElement("button");
     zoom.type = "button";
     zoom.className = "zoom";
@@ -304,7 +314,10 @@ function resultState(steps, inThisRun) {
 function appendResult(nodes, edges, previous, id, steps, inThisRun, hostId, disabled) {
   const stateText = resultState(steps, inThisRun);
   const saved = lineView[hostId] || lineView[String(hostId)] || {};
-  const sub = saved.finishedAt ? stateText.sub + " · 完成时间 " + saved.finishedAt : stateText.sub;
+  const fromSteps = ([...steps].reverse().find((step) => step.finished_at) || {}).finished_at || "";
+  const showTime = stateText.title === "成功" || stateText.title === "失败";
+  saved.finishedAt = showTime ? (saved.finishedAt || fromSteps) : "";
+  const sub = stateText.sub;
   const node = place({
     id,
     x: previous.x + 290,
@@ -312,6 +325,7 @@ function appendResult(nodes, edges, previous, id, steps, inThisRun, hostId, disa
     kicker: "执行结果",
     title: stateText.title,
     sub,
+    finishedAt: saved.finishedAt || "",
     tone: disabled ? "disabled" : stateText.tone,
     badge: disabled ? "已禁用" : (stateText.title === "未执行" ? "" : stateText.title),
     title: disabled ? "已禁用" : stateText.title,
@@ -436,6 +450,7 @@ function buildGraph() {
         actions: [
           ...(step.status === "failed" ? [{ label: "从这里继续", run: () => runLine(host.id, step.step_id || (ownSteps[index] && ownSteps[index].id)) }] : []),
           { label: "查看命令", run: () => openViewer({ title: "完整命令", kicker: "查看", sub: "", badge: "", log: commandText }) },
+          { label: "查看执行结果", run: () => openViewer({ title: "执行结果", kicker: "结果", sub: "", badge: "", log: (step.output || "").replace(/本次未重复执行/g, "").trim() || "还没有执行结果" }) },
           { label: "编辑命令", run: () => editStep(ownSteps[index] || step) },
           { label: "删除这条命令", run: () => deleteCommand(ownSteps[index] || step) },
         ],
@@ -716,12 +731,23 @@ document.querySelector("#add-step").onclick = () => addStep("remote");
 document.querySelector("#add-upload").onclick = () => addStep("upload");
 document.querySelector("#add-download").onclick = () => addStep("download");
 
-function refreshLine(host) {
-  const previous = lineView[host.id] || lineView[String(host.id)] || {};
-  lineStatus[host.id] = [];
-  lineView[host.id] = { steps: [], cleared: true, finishedAt: previous.finishedAt || "" };
-  saveView();
-  draw();
+async function refreshLine(host) {
+  try {
+    const plan = currentPlan();
+    if (!plan) throw new Error("请先选择方案");
+    await api("/api/line-flags", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ planId: Number(plan.id), hostId: Number(host.id), forceRun: true }),
+    });
+    const previous = lineView[host.id] || lineView[String(host.id)] || {};
+    lineStatus[host.id] = [];
+    lineView[host.id] = { steps: [], cleared: true, finishedAt: previous.finishedAt || "" };
+    saveView();
+    draw();
+  } catch (error) {
+    alert(error.message);
+  }
 }
 
 async function runLine(hostId, fromStepId) {
