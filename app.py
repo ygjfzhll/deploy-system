@@ -43,16 +43,27 @@ def now():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def max_parallel_lines():
+def load_app_config():
     import json
+    import re
     path = DATA / "app.json"
     if not path.is_file():
-        return 6
+        return {}
+    text = path.read_text(encoding="utf-8")
+    text = re.sub(r"(^|\s)//.*?$", "", text, flags=re.M)
+    return json.loads(text)
+
+
+def app_setting(name, default, minimum=1):
     try:
-        value = int(json.loads(path.read_text(encoding="utf-8")).get("max_parallel_lines") or 6)
+        value = int(load_app_config().get(name) or default)
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return 6
-    return max(1, value)
+        return default
+    return max(minimum, value)
+
+
+def max_parallel_lines():
+    return app_setting("max_parallel_lines", 6)
 
 
 
@@ -324,7 +335,7 @@ def auth_options(host):
         return [
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ConnectTimeout=15",
+            "-o", f"ConnectTimeout={app_setting('ssh_connect_timeout', 15)}",
             "-o", "PreferredAuthentications=password",
             "-o", "PubkeyAuthentication=no",
             "-o", "NumberOfPasswordPrompts=1",
@@ -333,7 +344,7 @@ def auth_options(host):
         "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "ConnectTimeout=15",
+        "-o", f"ConnectTimeout={app_setting('ssh_connect_timeout', 15)}",
     ]
 
 
@@ -519,7 +530,7 @@ def ensure_shell(shells, host):
     proc.stdin.write(b"set +e\nexport DEPLOY_PREV_OUTPUT=\nexport DEPLOY_PREV_STATUS=0\nprintf '%s\n' __DEPLOY_READY__\n")
     proc.stdin.flush()
     startup = []
-    ready, _ = read_until(proc, 0, "__DEPLOY_READY__", timeout=20, collect=startup)
+    ready, _ = read_until(proc, 0, "__DEPLOY_READY__", timeout=app_setting("ssh_ready_timeout", 20), collect=startup)
     if ready is not True or proc.poll() is not None:
         detail = "".join(startup).strip() or "没有收到远程终端响应"
         raise OSError("远程终端没有建立成功\n" + detail)
@@ -761,7 +772,7 @@ def run_remote(proc, shells, host, item_id, command):
     _fcntl.fcntl(fd_in, _fcntl.F_SETFL, _fcntl.fcntl(fd_in, _fcntl.F_GETFL) | os.O_NONBLOCK)
     pending = ""
     matched = None
-    deadline = time.time() + 120
+    deadline = time.time() + app_setting("command_timeout", 120)
     try:
         while matched is None:
             if time.time() > deadline:
@@ -802,9 +813,23 @@ def run_remote(proc, shells, host, item_id, command):
     return code
 
 
+def live_procs():
+    procs = [proc for proc in (_current.get("procs") or []) if proc and proc.poll() is None]
+    current = _current.get("proc")
+    if current and current.poll() is None and current not in procs:
+        procs.append(current)
+    return procs
+
+
 def start_run(plan_id, host_ids, from_step_id=None):
     if _current["run_id"]:
-        raise RuntimeError("已有任务正在执行")
+        if live_procs():
+            raise RuntimeError("已有任务正在执行")
+        finish_run(_current["run_id"], "cancelled", "上次任务已中断")
+        _current["run_id"] = None
+        _current["cancel"] = False
+        _current["proc"] = None
+        _current["procs"] = []
     with connect() as conn:
         plan = conn.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
         if not plan:
