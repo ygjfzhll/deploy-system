@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import shlex
+import select
 import signal
 import sqlite3
 import subprocess
@@ -20,7 +21,23 @@ DB_PATH = DATA / "app.sqlite"
 PUBLIC = ROOT / "public"
 
 _lock = threading.Lock()
-_current = {"run_id": None, "proc": None, "cancel": False}
+_line_slots = threading.Semaphore(6)
+_current = {"run_id": None, "proc": None, "procs": [], "cancel": False}
+
+
+def remember_proc(proc):
+    with _lock:
+        if proc not in _current["procs"]:
+            _current["procs"].append(proc)
+        _current["proc"] = proc
+
+
+def forget_proc(proc):
+    with _lock:
+        if proc in _current["procs"]:
+            _current["procs"].remove(proc)
+        if _current.get("proc") is proc:
+            _current["proc"] = None
 
 
 def now():
@@ -28,7 +45,7 @@ def now():
 
 
 def connect():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -222,8 +239,11 @@ def command_env(host):
     if not password:
         return env
     askpass = DATA / "askpass.sh"
-    askpass.write_text("#!/bin/sh\nprintf '%s\\n' \"$DEPLOY_SSH_PASSWORD\"\n", encoding="utf-8")
-    askpass.chmod(0o700)
+    if not askpass.exists():
+        with _lock:
+            if not askpass.exists():
+                askpass.write_text("#!/bin/sh\nprintf '%s\\n' \"$DEPLOY_SSH_PASSWORD\"\n", encoding="utf-8")
+                askpass.chmod(0o700)
     env["DEPLOY_SSH_PASSWORD"] = password
     env["SSH_ASKPASS"] = str(askpass)
     env["SSH_ASKPASS_REQUIRE"] = "force"
@@ -327,24 +347,54 @@ def skip_host_rest(run_id, host_id):
         )
 
 
-def read_until(proc, item_id, marker):
+def read_until(proc, item_id, marker, timeout=None, collect=None, prefix=False):
     output_len = 0
     assert proc.stdout is not None
+    fd = proc.stdout.fileno()
+    deadline = time.time() + timeout if timeout else None
+    pending = ""
     while True:
-        line = proc.stdout.readline()
-        if line == "":
+        if proc.poll() is not None and not pending:
             return None, output_len
-        if line.strip() == marker:
-            return True, output_len
-        output_len += len(line)
-        if output_len <= 200_000:
-            append_output(item_id, line)
-        if _current["cancel"]:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            return False, output_len
+        remain = None
+        if deadline is not None:
+            remain = deadline - time.time()
+            if remain <= 0:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                raise TimeoutError("SSH 连接超时")
+        ready, _, _ = select.select([fd], [], [], 1 if remain is None else min(1, remain))
+        if not ready:
+            if _current["cancel"]:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                return False, output_len
+            continue
+        try:
+            chunk = os.read(fd, 4096)
+        except BlockingIOError:
+            continue
+        if chunk == b"":
+            return None, output_len
+        pending += chunk.decode("utf-8", errors="replace")
+        while "\n" in pending:
+            line, pending = pending.split("\n", 1)
+            line = line + "\n"
+            if collect is not None:
+                collect.append(line)
+            stripped = line.strip()
+            if prefix and stripped.startswith(marker):
+                return stripped, output_len
+            if stripped == marker:
+                return True, output_len
+            output_len += len(line)
+            if item_id and output_len <= 200_000:
+                append_output(item_id, line)
+    return None, output_len
 
 
 def ensure_shell(shells, host):
@@ -357,16 +407,18 @@ def ensure_shell(shells, host):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         stdin=subprocess.PIPE,
-        text=True,
-        bufsize=1,
+        text=False,
+        bufsize=0,
         env=command_env(host),
         start_new_session=True,
     )
-    proc.stdin.write("set +e\nexport DEPLOY_PREV_OUTPUT=\nexport DEPLOY_PREV_STATUS=0\nprintf '%s\\n' __DEPLOY_READY__\n")
+    proc.stdin.write(b"set +e\nexport DEPLOY_PREV_OUTPUT=\nexport DEPLOY_PREV_STATUS=0\nprintf '%s\n' __DEPLOY_READY__\n")
     proc.stdin.flush()
-    ready, _ = read_until(proc, 0, "__DEPLOY_READY__")
+    startup = []
+    ready, _ = read_until(proc, 0, "__DEPLOY_READY__", timeout=20, collect=startup)
     if ready is not True or proc.poll() is not None:
-        raise OSError("远程终端没有建立成功")
+        detail = "".join(startup).strip() or "没有收到远程终端响应"
+        raise OSError("远程终端没有建立成功\n" + detail)
     shells[host["id"]] = proc
     shells[str(host["id"]) + ":n"] = 0
     return proc
@@ -405,7 +457,7 @@ printf '%s\\n' '{marker} '$DEPLOY_PREV_STATUS
 """
     proc.stdin.write(script)
     proc.stdin.flush()
-    _current["proc"] = proc
+    remember_proc(proc)
     seen, _ = read_until(proc, item_id, marker)
     code = 1
     if seen is True:
@@ -424,15 +476,7 @@ def latest_step(step):
     return dict(row) if row else step
 
 
-def execute_run(run_id):
-    with connect() as conn:
-        items = rows(
-            conn,
-            "SELECT * FROM run_steps WHERE run_id=? AND status='pending' ORDER BY position, id",
-            (run_id,),
-        )
-        hosts = {h["id"]: h for h in rows(conn, "SELECT * FROM hosts")}
-        steps = {s["id"]: s for s in rows(conn, "SELECT * FROM steps")}
+def run_host_line(run_id, items, hosts, steps):
     failure_messages = []
     stopped_hosts = set()
     shells = {}
@@ -444,9 +488,8 @@ def execute_run(run_id):
                 if isinstance(host_id, int):
                     close_shell(shells, host_id)
             update_step(item["id"], status="skipped", finished_at=now(), output="已手动停止\n")
-            skip_rest(run_id)
-            finish_run(run_id, "cancelled", "已手动停止")
-            return
+            skip_host_rest(run_id, item["host_id"])
+            return failure_messages
         host = hosts.get(item["host_id"])
         step = latest_step(steps.get(item["step_id"]))
         update_step(item["id"], status="running", started_at=now())
@@ -478,7 +521,7 @@ def execute_run(run_id):
                     env=command_env(host),
                     start_new_session=True,
                 )
-                _current["proc"] = proc
+                remember_proc(proc)
                 output_len = 0
                 captured = []
                 assert proc.stdout is not None
@@ -494,7 +537,7 @@ def execute_run(run_id):
                             pass
                         break
                 code = proc.wait()
-                _current["proc"] = None
+                forget_proc(proc)
                 if code == 0 and "error" in "".join(captured).lower():
                     code = 1
                     append_output(item["id"], "\n输出中包含 error，已标红并停止后续步骤\n")
@@ -513,9 +556,8 @@ def execute_run(run_id):
                     close_shell(shells, host_id)
             update_step(item["id"], status="failed", finished_at=now(), exit_code=code if isinstance(code, int) else 1)
             append_output(item["id"], "\n已手动停止\n")
-            skip_rest(run_id)
-            finish_run(run_id, "cancelled", "已手动停止")
-            return
+            skip_host_rest(run_id, item["host_id"])
+            return failure_messages
         if code != 0:
             update_step(item["id"], status="failed", finished_at=now(), exit_code=code)
             append_output(item["id"], f"\n退出码 {code}，已停止后续步骤\n")
@@ -530,12 +572,59 @@ def execute_run(run_id):
     for host_id in list(shells):
         if isinstance(host_id, int):
             close_shell(shells, host_id)
-    if failure_messages:
-        finish_run(run_id, "failed", "；".join(failure_messages))
+    return failure_messages
+
+
+def execute_run(run_id):
+    with connect() as conn:
+        items = rows(
+            conn,
+            "SELECT * FROM run_steps WHERE run_id=? AND status='pending' ORDER BY position, id",
+            (run_id,),
+        )
+        hosts = {h["id"]: h for h in rows(conn, "SELECT * FROM hosts")}
+        steps = {s["id"]: s for s in rows(conn, "SELECT * FROM steps")}
+    groups = {}
+    order = []
+    for item in items:
+        host_id = item["host_id"]
+        if host_id not in groups:
+            groups[host_id] = []
+            order.append(host_id)
+        groups[host_id].append(item)
+    failure_messages = []
+    lock = threading.Lock()
+
+    def worker(host_items):
+        with _line_slots:
+            if _current["cancel"]:
+                return
+            try:
+                messages = run_host_line(run_id, host_items, hosts, steps)
+            except Exception as exc:
+                host_id = host_items[0]["host_id"] if host_items else None
+                if host_id is not None:
+                    skip_host_rest(run_id, host_id)
+                messages = [str(exc)]
+            if messages:
+                with lock:
+                    failure_messages.extend(messages)
+
+    threads = [threading.Thread(target=worker, args=(groups[host_id],), daemon=True) for host_id in order]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if _current["cancel"]:
+        skip_rest(run_id)
+        finish_run(run_id, "cancelled", "已手动停止")
+    elif failure_messages:
+        finish_run(run_id, "failed", "；".join(dict.fromkeys(failure_messages)))
     else:
         finish_run(run_id, "success", "全部完成")
     _current["run_id"] = None
     _current["cancel"] = False
+    _current["procs"] = []
 
 
 def run_remote(proc, shells, host, item_id, command):
@@ -549,44 +638,60 @@ def run_remote(proc, shells, host, item_id, command):
         f"END_{token}\n"
         f"source /tmp/{token}.cmd > /tmp/{token}.out 2>&1\n"
         f"export DEPLOY_PREV_STATUS=$?\n"
+        f"cat /tmp/{token}.out\n"
         f"export DEPLOY_PREV_OUTPUT=\"$(cat /tmp/{token}.out)\"\n"
         f"export DEPLOY_OUTPUT_{count}=\"$DEPLOY_PREV_OUTPUT\"\n"
-        f"cat /tmp/{token}.out\n"
         f"printf '%s\\n' \"{marker} $DEPLOY_PREV_STATUS\"\n"
     )
-    proc.stdin.write(script)
-    proc.stdin.flush()
-    _current["proc"] = proc
-    output_len = 0
+    remember_proc(proc)
     captured = []
-    assert proc.stdout is not None
-    while True:
-        line = proc.stdout.readline()
-        if line == "":
-            _current["proc"] = None
-            return 1
-        stripped = line.strip()
-        if stripped.startswith(marker + " "):
-            _current["proc"] = None
-            try:
-                code = int(stripped.rsplit(" ", 1)[-1])
-            except ValueError:
-                code = 1
-            if code == 0 and "error" in "".join(captured).lower():
-                append_output(item_id, "\n输出中包含 error，已标红并停止后续步骤\n")
-                return 1
-            return code
-        captured.append(line)
-        output_len += len(line)
-        if output_len <= 200_000:
-            append_output(item_id, line)
-        if _current["cancel"]:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            _current["proc"] = None
-            return 1
+    data = script.encode()
+    sent = 0
+    fd_in = proc.stdin.fileno()
+    fd_out = proc.stdout.fileno()
+    import fcntl as _fcntl
+    _fcntl.fcntl(fd_in, _fcntl.F_SETFL, _fcntl.fcntl(fd_in, _fcntl.F_GETFL) | os.O_NONBLOCK)
+    pending = ""
+    matched = None
+    deadline = time.time() + 120
+    try:
+        while matched is None:
+            if time.time() > deadline:
+                raise TimeoutError("命令结果超时")
+            readable, _, _ = select.select([fd_out], [], [], 0.2)
+            if fd_out in readable:
+                chunk = os.read(fd_out, 4096)
+                if chunk == b"" and proc.poll() is not None:
+                    break
+                pending += chunk.decode("utf-8", errors="replace")
+                while "\n" in pending:
+                    line, pending = pending.split("\n", 1)
+                    line += "\n"
+                    stripped = line.strip()
+                    if stripped.startswith(marker + " "):
+                        matched = stripped
+                        break
+                    captured.append(line)
+                    if len("".join(captured)) <= 200_000:
+                        append_output(item_id, line)
+            if sent < len(data):
+                try:
+                    sent += os.write(fd_in, data[sent:sent + 1024])
+                except BlockingIOError:
+                    pass
+    finally:
+        forget_proc(proc)
+    if not isinstance(matched, str):
+        return 1
+    try:
+        code = int(matched.rsplit(" ", 1)[-1])
+    except ValueError:
+        code = 1
+    body = "".join(line for line in captured if not line.strip().startswith(marker))
+    if code == 0 and "error" in body.lower():
+        append_output(item_id, "\n输出中包含 error，已标红并停止后续步骤\n")
+        return 1
+    return code
 
 
 def start_run(plan_id, host_ids, from_step_id=None):
@@ -674,11 +779,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_json(self, payload, status=200):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def read_json(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -723,11 +831,14 @@ class Handler(BaseHTTPRequestHandler):
         if not file.is_file():
             return self.send_json({"error": "页面缺失"}, 404)
         body = file.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -753,12 +864,15 @@ class Handler(BaseHTTPRequestHandler):
                 if _current["run_id"] != run_id:
                     return self.send_json({"error": "这个任务没有在执行"}, 400)
                 _current["cancel"] = True
-                proc = _current["proc"]
-                if proc and proc.poll() is None:
-                    try:
-                        os.killpg(proc.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
+                procs = list(_current.get("procs") or [])
+                if _current.get("proc") and _current["proc"] not in procs:
+                    procs.append(_current["proc"])
+                for proc in procs:
+                    if proc and proc.poll() is None:
+                        try:
+                            os.killpg(proc.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
                 return self.send_json({"ok": True})
         except (ValueError, RuntimeError, KeyError, json.JSONDecodeError) as exc:
             return self.send_json({"error": str(exc)}, 400)
