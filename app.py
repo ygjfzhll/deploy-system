@@ -1,0 +1,998 @@
+#!/usr/bin/env python3
+"""Linux 部署分发控制台：配置目标后，用系统 ssh/scp 顺序执行，并记录状态。"""
+
+import argparse
+import json
+import os
+import shlex
+import signal
+import sqlite3
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse
+
+ROOT = Path(__file__).resolve().parent
+DATA = ROOT / "data"
+DB_PATH = DATA / "app.sqlite"
+PUBLIC = ROOT / "public"
+
+_lock = threading.Lock()
+_current = {"run_id": None, "proc": None, "cancel": False}
+
+
+def now():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def connect():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def assign_legacy_steps(conn):
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(steps)")]
+    if "note" not in columns:
+        conn.execute("ALTER TABLE steps ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(steps)")]
+    if "host_id" not in columns:
+        conn.execute("ALTER TABLE steps ADD COLUMN host_id INTEGER")
+    legacy = [dict(row) for row in conn.execute("SELECT * FROM steps WHERE host_id IS NULL ORDER BY position, id")]
+    hosts = [dict(row) for row in conn.execute("SELECT id FROM hosts ORDER BY id")]
+    if not legacy or not hosts:
+        return
+    for host in hosts:
+        count = conn.execute("SELECT COUNT(*) AS n FROM steps WHERE host_id=?", (host["id"],)).fetchone()["n"]
+        if count:
+            continue
+        for step in legacy:
+            conn.execute(
+                """
+                INSERT INTO steps (plan_id, host_id, position, kind, command, local_path, remote_path, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (step["plan_id"], host["id"], step["position"], step["kind"], step["command"], step["local_path"], step["remote_path"], step["note"] if "note" in step.keys() else ""),
+            )
+    conn.execute("DELETE FROM steps WHERE host_id IS NULL")
+
+
+def init_db():
+    DATA.mkdir(exist_ok=True)
+    with connect() as conn:
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(hosts)")]
+        if "password" not in columns:
+            conn.execute("ALTER TABLE hosts ADD COLUMN password TEXT NOT NULL DEFAULT ''")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS hosts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL,
+              ip TEXT NOT NULL,
+              port INTEGER NOT NULL DEFAULT 22,
+              username TEXT NOT NULL,
+              identity_file TEXT NOT NULL DEFAULT '',
+              password TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS plans (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS steps (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              plan_id INTEGER NOT NULL,
+              position INTEGER NOT NULL,
+              kind TEXT NOT NULL,
+              command TEXT NOT NULL DEFAULT '',
+              local_path TEXT NOT NULL DEFAULT '',
+              remote_path TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS runs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              plan_id INTEGER,
+              plan_name TEXT NOT NULL,
+              status TEXT NOT NULL,
+              message TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              finished_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS run_steps (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id INTEGER NOT NULL,
+              position INTEGER NOT NULL,
+              host_id INTEGER,
+              host_label TEXT NOT NULL,
+              step_id INTEGER,
+              kind TEXT NOT NULL,
+              preview TEXT NOT NULL,
+              status TEXT NOT NULL,
+              output TEXT NOT NULL DEFAULT '',
+              exit_code INTEGER,
+              started_at TEXT,
+              finished_at TEXT
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS line_flags (
+              plan_id INTEGER NOT NULL,
+              host_id INTEGER NOT NULL,
+              disabled INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY (plan_id, host_id)
+            )
+            """
+        )
+        assign_legacy_steps(conn)
+
+
+def rows(conn, sql, args=()):
+    return [dict(r) for r in conn.execute(sql, args).fetchall()]
+
+
+def public_state():
+    with connect() as conn:
+        hosts = rows(conn, "SELECT * FROM hosts ORDER BY id")
+        for host in hosts:
+            host["has_password"] = bool(host.get("password"))
+            host.pop("password", None)
+        plans = rows(conn, "SELECT * FROM plans ORDER BY id DESC")
+        flags = rows(conn, "SELECT plan_id, host_id FROM line_flags WHERE disabled=1")
+        for plan in plans:
+            plan["steps"] = rows(
+                conn,
+                "SELECT * FROM steps WHERE plan_id=? ORDER BY position, id",
+                (plan["id"],),
+            )
+            plan["disabledHostIds"] = [row["host_id"] for row in flags if row["plan_id"] == plan["id"]]
+        runs = rows(conn, "SELECT * FROM runs ORDER BY id DESC LIMIT 30")
+    return {"hosts": hosts, "plans": plans, "runs": runs}
+
+
+def latest_line(plan_id, host_id):
+    with connect() as conn:
+        host = conn.execute("SELECT * FROM hosts WHERE id=?", (host_id,)).fetchone()
+        if not host:
+            return None
+        run = conn.execute(
+            """
+            SELECT runs.* FROM runs
+            JOIN run_steps ON run_steps.run_id = runs.id
+            WHERE runs.plan_id=? AND run_steps.host_id=?
+            ORDER BY runs.id DESC
+            LIMIT 1
+            """,
+            (plan_id, host_id),
+        ).fetchone()
+        if not run:
+            return {"id": None, "status": "", "message": "", "steps": []}
+        data = dict(run)
+        data["steps"] = rows(
+            conn,
+            "SELECT * FROM run_steps WHERE run_id=? AND host_id=? ORDER BY position, id",
+            (run["id"], host_id),
+        )
+        return data
+
+
+def run_detail(run_id):
+    with connect() as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            return None
+        data = dict(run)
+        data["steps"] = rows(
+            conn,
+            "SELECT * FROM run_steps WHERE run_id=? ORDER BY position, id",
+            (run_id,),
+        )
+    total = len(data["steps"])
+    done = sum(1 for s in data["steps"] if s["status"] in ("success", "failed", "skipped"))
+    data["total"] = total
+    data["done"] = done
+    data["percent"] = int(done * 100 / total) if total else 0
+    return data
+
+
+def auth_options(host):
+    if (host.get("password") or "").strip():
+        return [
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=15",
+            "-o", "PreferredAuthentications=password",
+            "-o", "PubkeyAuthentication=no",
+            "-o", "NumberOfPasswordPrompts=1",
+        ]
+    return [
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=15",
+    ]
+
+
+def command_env(host):
+    env = os.environ.copy()
+    password = (host.get("password") or "").strip()
+    if not password:
+        return env
+    askpass = DATA / "askpass.sh"
+    askpass.write_text("#!/bin/sh\nprintf '%s\\n' \"$DEPLOY_SSH_PASSWORD\"\n", encoding="utf-8")
+    askpass.chmod(0o700)
+    env["DEPLOY_SSH_PASSWORD"] = password
+    env["SSH_ASKPASS"] = str(askpass)
+    env["SSH_ASKPASS_REQUIRE"] = "force"
+    env.setdefault("DISPLAY", ":0")
+    return env
+
+
+def ssh_base(host):
+    cmd = ["ssh", *auth_options(host), "-p", str(host["port"])]
+    if host["identity_file"] and not (host.get("password") or "").strip():
+        cmd.extend(["-i", host["identity_file"]])
+    cmd.append(f"{host['username']}@{host['ip']}")
+    return cmd
+
+
+def build_argv(host, step):
+    kind = step["kind"]
+    if kind == "remote":
+        command = step["command"].strip()
+        if not command:
+            raise ValueError("远程命令不能为空")
+        return ssh_base(host) + [command], command
+    if kind in ("upload", "download"):
+        local_path = step["local_path"].strip()
+        remote_path = step["remote_path"].strip()
+        if not local_path or not remote_path:
+            raise ValueError("文件传输需要本地路径和远端路径")
+        remote = f"{host['username']}@{host['ip']}:{remote_path}"
+        cmd = ["scp", *auth_options(host), "-P", str(host["port"])]
+        if host["identity_file"] and not (host.get("password") or "").strip():
+            cmd.extend(["-i", host["identity_file"]])
+        if kind == "upload":
+            cmd.extend([local_path, remote])
+            preview = f"scp {local_path} {remote}"
+        else:
+            cmd.extend([remote, local_path])
+            preview = f"scp {remote} {local_path}"
+        return cmd, preview
+    if kind == "local":
+        command = step["command"].strip()
+        if not command:
+            raise ValueError("本机命令不能为空")
+        rendered = command.format(
+            ip=host["ip"],
+            port=host["port"],
+            user=host["username"],
+            name=host["name"],
+        )
+        return ["bash", "-lc", rendered], rendered
+    raise ValueError(f"不支持的步骤类型：{kind}")
+
+
+def update_step(step_id, **fields):
+    keys = ", ".join(f"{k}=?" for k in fields)
+    with _lock, connect() as conn:
+        conn.execute(
+            f"UPDATE run_steps SET {keys} WHERE id=?",
+            (*fields.values(), step_id),
+        )
+
+
+def append_output(step_id, text):
+    if not text:
+        return
+    with _lock, connect() as conn:
+        conn.execute(
+            "UPDATE run_steps SET output = output || ? WHERE id=?",
+            (text, step_id),
+        )
+
+
+def finish_run(run_id, status, message):
+    with _lock, connect() as conn:
+        conn.execute(
+            "UPDATE runs SET status=?, message=?, finished_at=? WHERE id=?",
+            (status, message, now(), run_id),
+        )
+
+
+def skip_rest(run_id):
+    with _lock, connect() as conn:
+        conn.execute(
+            """
+            UPDATE run_steps
+            SET status='skipped', finished_at=?
+            WHERE run_id=? AND status='pending'
+            """,
+            (now(), run_id),
+        )
+
+
+def skip_host_rest(run_id, host_id):
+    with _lock, connect() as conn:
+        conn.execute(
+            """
+            UPDATE run_steps
+            SET status='skipped', finished_at=?
+            WHERE run_id=? AND host_id=? AND status='pending'
+            """,
+            (now(), run_id, host_id),
+        )
+
+
+def read_until(proc, item_id, marker):
+    output_len = 0
+    assert proc.stdout is not None
+    while True:
+        line = proc.stdout.readline()
+        if line == "":
+            return None, output_len
+        if line.strip() == marker:
+            return True, output_len
+        output_len += len(line)
+        if output_len <= 200_000:
+            append_output(item_id, line)
+        if _current["cancel"]:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            return False, output_len
+
+
+def ensure_shell(shells, host):
+    proc = shells.get(host["id"])
+    if proc and proc.poll() is None:
+        return proc
+    argv = ssh_base(host) + ["bash", "--noprofile", "--norc", "-s"]
+    proc = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=command_env(host),
+        start_new_session=True,
+    )
+    proc.stdin.write("set +e\nexport DEPLOY_PREV_OUTPUT=\nexport DEPLOY_PREV_STATUS=0\nprintf '%s\\n' __DEPLOY_READY__\n")
+    proc.stdin.flush()
+    ready, _ = read_until(proc, 0, "__DEPLOY_READY__")
+    if ready is not True or proc.poll() is not None:
+        raise OSError("远程终端没有建立成功")
+    shells[host["id"]] = proc
+    shells[str(host["id"]) + ":n"] = 0
+    return proc
+
+
+def close_shell(shells, host_id):
+    proc = shells.pop(host_id, None)
+    shells.pop(str(host_id) + ":n", None)
+    if not proc or proc.poll() is not None:
+        return
+    try:
+        proc.stdin.write("exit\n")
+        proc.stdin.flush()
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+def run_in_shell(proc, shells, host, item_id, command):
+    count = int(shells.get(str(host["id"]) + ":n", 0)) + 1
+    shells[str(host["id"]) + ":n"] = count
+    token = f"DEPLOY_DONE_{item_id}_{count}"
+    marker = f"__{token}__"
+    script = f"""cat > /tmp/{token}.cmd <<'END_{token}'
+{command}
+END_{token}
+source /tmp/{token}.cmd > /tmp/{token}.out 2>&1
+export DEPLOY_PREV_STATUS=$?
+export DEPLOY_PREV_OUTPUT="$(cat /tmp/{token}.out)"
+export DEPLOY_OUTPUT_{count}="$DEPLOY_PREV_OUTPUT"
+cat /tmp/{token}.out
+printf '%s\\n' '{marker} '$DEPLOY_PREV_STATUS
+"""
+    proc.stdin.write(script)
+    proc.stdin.flush()
+    _current["proc"] = proc
+    seen, _ = read_until(proc, item_id, marker)
+    code = 1
+    if seen is True:
+        last = ""
+        # marker line was consumed by read_until only when exact strip match.
+        # Status is appended after the marker text in the same line, so match differently.
+        code = 0
+    return seen, code
+
+
+def latest_step(step):
+    if not step or not step.get("id"):
+        return step
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM steps WHERE id=?", (step["id"],)).fetchone()
+    return dict(row) if row else step
+
+
+def execute_run(run_id):
+    with connect() as conn:
+        items = rows(
+            conn,
+            "SELECT * FROM run_steps WHERE run_id=? AND status='pending' ORDER BY position, id",
+            (run_id,),
+        )
+        hosts = {h["id"]: h for h in rows(conn, "SELECT * FROM hosts")}
+        steps = {s["id"]: s for s in rows(conn, "SELECT * FROM steps")}
+    failure_messages = []
+    stopped_hosts = set()
+    shells = {}
+    for item in items:
+        if item["host_id"] in stopped_hosts:
+            continue
+        if _current["cancel"]:
+            for host_id in list(shells):
+                if isinstance(host_id, int):
+                    close_shell(shells, host_id)
+            update_step(item["id"], status="skipped", finished_at=now(), output="已手动停止\n")
+            skip_rest(run_id)
+            finish_run(run_id, "cancelled", "已手动停止")
+            return
+        host = hosts.get(item["host_id"])
+        step = latest_step(steps.get(item["step_id"]))
+        update_step(item["id"], status="running", started_at=now())
+        if not host or not step:
+            update_step(item["id"], status="failed", finished_at=now(), exit_code=1, output="目标或命令已不存在\n")
+            message = "目标或命令已不存在"
+            stopped_hosts.add(item["host_id"])
+            if item.get("host_id") is not None:
+                close_shell(shells, item["host_id"])
+                skip_host_rest(run_id, item["host_id"])
+            failure_messages.append(message)
+            continue
+        try:
+            if step["kind"] == "remote":
+                proc = ensure_shell(shells, host)
+                code = run_remote(proc, shells, host, item["id"], step["command"])
+                preview = step["command"].strip()
+                update_step(item["id"], preview=preview)
+            else:
+                argv, preview = build_argv(host, step)
+                update_step(item["id"], preview=preview)
+                proc = subprocess.Popen(
+                    argv,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                    env=command_env(host),
+                    start_new_session=True,
+                )
+                _current["proc"] = proc
+                output_len = 0
+                captured = []
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    output_len += len(line)
+                    captured.append(line)
+                    if output_len <= 200_000:
+                        append_output(item["id"], line)
+                    if _current["cancel"]:
+                        try:
+                            os.killpg(proc.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        break
+                code = proc.wait()
+                _current["proc"] = None
+                if code == 0 and "error" in "".join(captured).lower():
+                    code = 1
+                    append_output(item["id"], "\n输出中包含 error，已标红并停止后续步骤\n")
+        except (ValueError, OSError) as exc:
+            update_step(item["id"], status="failed", finished_at=now(), exit_code=1, output=str(exc) + "\n")
+            message = str(exc)
+            stopped_hosts.add(item["host_id"])
+            if item.get("host_id") is not None:
+                close_shell(shells, item["host_id"])
+                skip_host_rest(run_id, item["host_id"])
+            failure_messages.append(message)
+            continue
+        if _current["cancel"]:
+            for host_id in list(shells):
+                if isinstance(host_id, int):
+                    close_shell(shells, host_id)
+            update_step(item["id"], status="failed", finished_at=now(), exit_code=code if isinstance(code, int) else 1)
+            append_output(item["id"], "\n已手动停止\n")
+            skip_rest(run_id)
+            finish_run(run_id, "cancelled", "已手动停止")
+            return
+        if code != 0:
+            update_step(item["id"], status="failed", finished_at=now(), exit_code=code)
+            append_output(item["id"], f"\n退出码 {code}，已停止后续步骤\n")
+            message = f"{item['host_label']} 执行失败，退出码 {code}"
+            stopped_hosts.add(item["host_id"])
+            if item.get("host_id") is not None:
+                close_shell(shells, item["host_id"])
+                skip_host_rest(run_id, item["host_id"])
+            failure_messages.append(message)
+            continue
+        update_step(item["id"], status="success", finished_at=now(), exit_code=0)
+    for host_id in list(shells):
+        if isinstance(host_id, int):
+            close_shell(shells, host_id)
+    if failure_messages:
+        finish_run(run_id, "failed", "；".join(failure_messages))
+    else:
+        finish_run(run_id, "success", "全部完成")
+    _current["run_id"] = None
+    _current["cancel"] = False
+
+
+def run_remote(proc, shells, host, item_id, command):
+    count = int(shells.get(str(host["id"]) + ":n", 0)) + 1
+    shells[str(host["id"]) + ":n"] = count
+    token = f"DEPLOY_DONE_{item_id}_{count}"
+    marker = f"__{token}__"
+    script = (
+        f"cat > /tmp/{token}.cmd <<'END_{token}'\n"
+        f"{command}\n"
+        f"END_{token}\n"
+        f"source /tmp/{token}.cmd > /tmp/{token}.out 2>&1\n"
+        f"export DEPLOY_PREV_STATUS=$?\n"
+        f"export DEPLOY_PREV_OUTPUT=\"$(cat /tmp/{token}.out)\"\n"
+        f"export DEPLOY_OUTPUT_{count}=\"$DEPLOY_PREV_OUTPUT\"\n"
+        f"cat /tmp/{token}.out\n"
+        f"printf '%s\\n' \"{marker} $DEPLOY_PREV_STATUS\"\n"
+    )
+    proc.stdin.write(script)
+    proc.stdin.flush()
+    _current["proc"] = proc
+    output_len = 0
+    captured = []
+    assert proc.stdout is not None
+    while True:
+        line = proc.stdout.readline()
+        if line == "":
+            _current["proc"] = None
+            return 1
+        stripped = line.strip()
+        if stripped.startswith(marker + " "):
+            _current["proc"] = None
+            try:
+                code = int(stripped.rsplit(" ", 1)[-1])
+            except ValueError:
+                code = 1
+            if code == 0 and "error" in "".join(captured).lower():
+                append_output(item_id, "\n输出中包含 error，已标红并停止后续步骤\n")
+                return 1
+            return code
+        captured.append(line)
+        output_len += len(line)
+        if output_len <= 200_000:
+            append_output(item_id, line)
+        if _current["cancel"]:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            _current["proc"] = None
+            return 1
+
+
+def start_run(plan_id, host_ids, from_step_id=None):
+    if _current["run_id"]:
+        raise RuntimeError("已有任务正在执行")
+    with connect() as conn:
+        plan = conn.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
+        if not plan:
+            raise ValueError("命令方案不存在")
+        disabled = {row["host_id"] for row in conn.execute("SELECT host_id FROM line_flags WHERE plan_id=? AND disabled=1", (plan_id,))}
+        hosts = []
+        for host_id in host_ids:
+            if host_id in disabled:
+                continue
+            host = conn.execute("SELECT * FROM hosts WHERE id=?", (host_id,)).fetchone()
+            if not host:
+                raise ValueError(f"目标不存在：{host_id}")
+            hosts.append(dict(host))
+        if not hosts:
+            raise ValueError("没有可执行的线，灰色禁用的线不会执行")
+        cur = conn.execute(
+            "INSERT INTO runs (plan_id, plan_name, status, created_at) VALUES (?, ?, 'running', ?)",
+            (plan_id, plan["name"], now()),
+        )
+        run_id = cur.lastrowid
+        position = 1
+        for host in hosts:
+            steps = [dict(row) for row in conn.execute("SELECT * FROM steps WHERE plan_id=? AND host_id=? ORDER BY position, id", (plan_id, host["id"]))]
+            if not steps:
+                raise ValueError(host["name"] + " 这条线还没有自己的命令")
+            resume_at = None
+            if from_step_id:
+                matched = [step for step in steps if step["id"] == from_step_id]
+                if not matched:
+                    raise ValueError("没有找到要继续的命令")
+                resume_at = matched[0]["position"]
+            for step in steps:
+                preview = step["command"] or f"{step['kind']} {step['local_path']} -> {step['remote_path']}"
+                status = "pending"
+                output = ""
+                exit_code = None
+                started = None
+                finished = None
+                if resume_at and step["position"] < resume_at:
+                    status = "success"
+                    prev = conn.execute(
+                        "SELECT output FROM run_steps WHERE step_id=? AND status='success' ORDER BY id DESC LIMIT 1",
+                        (step["id"],),
+                    ).fetchone()
+                    output = ((prev["output"] if prev and prev["output"] else "") + "\n已跳过，从失败命令继续\n").strip() + "\n"
+                    exit_code = 0
+                    started = now()
+                    finished = now()
+                conn.execute(
+                    """
+                    INSERT INTO run_steps
+                    (run_id, position, host_id, host_label, step_id, kind, preview, status, output, exit_code, started_at, finished_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        position,
+                        host["id"],
+                        f"{host['name']} ({host['username']}@{host['ip']})",
+                        step["id"],
+                        step["kind"],
+                        preview,
+                        status,
+                        output,
+                        exit_code,
+                        started,
+                        finished,
+                    ),
+                )
+                position += 1
+    _current["run_id"] = run_id
+    _current["cancel"] = False
+    threading.Thread(target=execute_run, args=(run_id,), daemon=True).start()
+    return run_id
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        return
+
+    def send_json(self, payload, status=200):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def read_json(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b"{}"
+        return json.loads(raw.decode("utf-8"))
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/":
+            return self.serve_file(PUBLIC / "index.html", "text/html; charset=utf-8")
+        if path.startswith("/static/"):
+            name = path.removeprefix("/static/")
+            file = PUBLIC / name
+            if file.is_file() and file.resolve().parent == PUBLIC.resolve():
+                kind = "text/css; charset=utf-8" if name.endswith(".css") else "text/javascript; charset=utf-8"
+                return self.serve_file(file, kind)
+        if path == "/api/state":
+            return self.send_json(public_state())
+        if path.startswith("/api/lines/"):
+            from urllib.parse import parse_qs
+            try:
+                host_id = int(path.rstrip("/").rsplit("/", 1)[-1])
+                plan_id = int(parse_qs(urlparse(self.path).query).get("planId", ["0"])[0])
+            except ValueError:
+                return self.send_json({"error": "无效参数"}, 400)
+            data = latest_line(plan_id, host_id)
+            if data is None:
+                return self.send_json({"error": "目标不存在"}, 404)
+            return self.send_json(data)
+        if path.startswith("/api/runs/"):
+            try:
+                run_id = int(path.rsplit("/", 1)[-1])
+            except ValueError:
+                return self.send_json({"error": "无效任务"}, 400)
+            data = run_detail(run_id)
+            if not data:
+                return self.send_json({"error": "任务不存在"}, 404)
+            return self.send_json(data)
+        self.send_json({"error": "未找到"}, 404)
+
+    def serve_file(self, file, content_type):
+        if not file.is_file():
+            return self.send_json({"error": "页面缺失"}, 404)
+        body = file.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        try:
+            payload = self.read_json()
+            if path == "/api/hosts":
+                return self.save_host(payload)
+            if path == "/api/plans":
+                return self.save_plan(payload)
+            if path == "/api/plans/copy":
+                return self.copy_plan(payload)
+            if path == "/api/line-flags":
+                return self.save_line_flag(payload)
+            if path == "/api/lines/copy":
+                return self.copy_line(payload)
+            if path == "/api/steps":
+                return self.save_step(payload)
+            if path == "/api/runs":
+                run_id = start_run(int(payload["planId"]), [int(x) for x in payload["hostIds"]], int(payload["fromStepId"]) if payload.get("fromStepId") else None)
+                return self.send_json({"id": run_id})
+            if path.endswith("/cancel") and path.startswith("/api/runs/"):
+                run_id = int(path.split("/")[3])
+                if _current["run_id"] != run_id:
+                    return self.send_json({"error": "这个任务没有在执行"}, 400)
+                _current["cancel"] = True
+                proc = _current["proc"]
+                if proc and proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                return self.send_json({"ok": True})
+        except (ValueError, RuntimeError, KeyError, json.JSONDecodeError) as exc:
+            return self.send_json({"error": str(exc)}, 400)
+        self.send_json({"error": "未找到"}, 404)
+
+    def save_host(self, payload):
+        name = payload.get("name", "").strip()
+        ip = payload.get("ip", "").strip()
+        username = payload.get("username", "").strip()
+        port = int(payload.get("port") or 22)
+        identity = payload.get("identityFile", "").strip()
+        password = payload.get("password", "")
+        if not name or not ip or not username:
+            raise ValueError("名称、IP 和用户名都要填写")
+        if port < 1 or port > 65535:
+            raise ValueError("端口不正确")
+        with connect() as conn:
+            if payload.get("id"):
+                if str(password).strip():
+                    conn.execute(
+                        """
+                        UPDATE hosts
+                        SET name=?, ip=?, port=?, username=?, identity_file=?, password=?
+                        WHERE id=?
+                        """,
+                        (name, ip, port, username, identity, password, int(payload["id"])),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE hosts
+                        SET name=?, ip=?, port=?, username=?, identity_file=?
+                        WHERE id=?
+                        """,
+                        (name, ip, port, username, identity, int(payload["id"])),
+                    )
+                host_id = int(payload["id"])
+            else:
+                cur = conn.execute(
+                    """
+                    INSERT INTO hosts (name, ip, port, username, identity_file, password, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (name, ip, port, username, identity, password or "", now()),
+                )
+                host_id = cur.lastrowid
+        self.send_json({"id": host_id})
+
+    def save_step(self, payload):
+        plan_id = int(payload.get("planId") or 0)
+        host_id = int(payload.get("hostId") or 0)
+        kind = payload.get("kind")
+        if kind not in ("remote", "upload", "download", "local"):
+            raise ValueError("步骤类型不正确")
+        if not plan_id or not host_id:
+            raise ValueError("请选择方案和对应的目标线")
+        command = str(payload.get("command") or "")
+        local_path = str(payload.get("localPath") or "")
+        remote_path = str(payload.get("remotePath") or "")
+        with connect() as conn:
+            if payload.get("id"):
+                conn.execute(
+                    """
+                    UPDATE steps
+                    SET kind=?, command=?, local_path=?, remote_path=?, host_id=?, note=?
+                    WHERE id=? AND plan_id=?
+                    """,
+                    (kind, command, local_path, remote_path, host_id, str(payload.get("note") or ""), int(payload["id"]), plan_id),
+                )
+                step_id = int(payload["id"])
+            else:
+                position = conn.execute(
+                    "SELECT COALESCE(MAX(position), 0) + 1 AS n FROM steps WHERE plan_id=? AND host_id=?",
+                    (plan_id, host_id),
+                ).fetchone()["n"]
+                cur = conn.execute(
+                    """
+                    INSERT INTO steps (plan_id, host_id, position, kind, command, local_path, remote_path, note)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (plan_id, host_id, position, kind, command, local_path, remote_path, str(payload.get("note") or "")),
+                )
+                step_id = cur.lastrowid
+        self.send_json({"id": step_id})
+
+    def copy_plan(self, payload):
+        plan_id = int(payload.get("id") or 0)
+        with connect() as conn:
+            plan = conn.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
+            if not plan:
+                raise ValueError("方案不存在")
+            cur = conn.execute(
+                "INSERT INTO plans (name, created_at) VALUES (?, ?)",
+                (plan["name"] + " 副本", now()),
+            )
+            new_id = cur.lastrowid
+            steps = conn.execute("SELECT * FROM steps WHERE plan_id=? ORDER BY position, id", (plan_id,)).fetchall()
+            for step in steps:
+                conn.execute(
+                    """
+                    INSERT INTO steps (plan_id, host_id, position, kind, command, local_path, remote_path, note)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (new_id, step["host_id"], step["position"], step["kind"], step["command"], step["local_path"], step["remote_path"], step["note"]),
+                )
+            flags = conn.execute("SELECT * FROM line_flags WHERE plan_id=?", (plan_id,)).fetchall()
+            for flag in flags:
+                conn.execute(
+                    "INSERT INTO line_flags (plan_id, host_id, disabled) VALUES (?, ?, ?)",
+                    (new_id, flag["host_id"], flag["disabled"]),
+                )
+        self.send_json({"id": new_id})
+
+    def copy_line(self, payload):
+        plan_id = int(payload.get("planId") or 0)
+        host_id = int(payload.get("hostId") or 0)
+        with connect() as conn:
+            host = conn.execute("SELECT * FROM hosts WHERE id=?", (host_id,)).fetchone()
+            if not host:
+                raise ValueError("目标不存在")
+            cur = conn.execute(
+                """
+                INSERT INTO hosts (name, ip, port, username, identity_file, password, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (host["name"] + " 副本", host["ip"], host["port"], host["username"], host["identity_file"], host["password"], now()),
+            )
+            new_host_id = cur.lastrowid
+            steps = conn.execute(
+                "SELECT * FROM steps WHERE plan_id=? AND host_id=? ORDER BY position, id",
+                (plan_id, host_id),
+            ).fetchall()
+            for index, step in enumerate(steps, start=1):
+                conn.execute(
+                    """
+                    INSERT INTO steps (plan_id, host_id, position, kind, command, local_path, remote_path, note)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (plan_id, new_host_id, index, step["kind"], step["command"], step["local_path"], step["remote_path"], step["note"]),
+                )
+            flag = conn.execute(
+                "SELECT disabled FROM line_flags WHERE plan_id=? AND host_id=?",
+                (plan_id, host_id),
+            ).fetchone()
+            if flag:
+                conn.execute(
+                    "INSERT INTO line_flags (plan_id, host_id, disabled) VALUES (?, ?, ?)",
+                    (plan_id, new_host_id, flag["disabled"]),
+                )
+        self.send_json({"id": new_host_id})
+
+    def save_line_flag(self, payload):
+        plan_id = int(payload.get("planId") or 0)
+        host_id = int(payload.get("hostId") or 0)
+        disabled = 1 if payload.get("disabled") else 0
+        if not plan_id or not host_id:
+            raise ValueError("请选择方案和目标线")
+        with connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO line_flags (plan_id, host_id, disabled) VALUES (?, ?, ?)
+                ON CONFLICT(plan_id, host_id) DO UPDATE SET disabled=excluded.disabled
+                """,
+                (plan_id, host_id, disabled),
+            )
+        self.send_json({"ok": True})
+
+    def save_plan(self, payload):
+        name = payload.get("name", "").strip()
+        steps = payload.get("steps")
+        if not name:
+            raise ValueError("方案名称不能为空")
+        with connect() as conn:
+            if payload.get("id"):
+                plan_id = int(payload["id"])
+                conn.execute("UPDATE plans SET name=? WHERE id=?", (name, plan_id))
+                if steps is not None:
+                    conn.execute("DELETE FROM steps WHERE plan_id=?", (plan_id,))
+            else:
+                cur = conn.execute(
+                    "INSERT INTO plans (name, created_at) VALUES (?, ?)",
+                    (name, now()),
+                )
+                plan_id = cur.lastrowid
+            if steps is not None:
+                for index, step in enumerate(steps, start=1):
+                    kind = step.get("kind")
+                    host_id = int(step.get("hostId") or 0)
+                    if kind not in ("remote", "upload", "download", "local") or not host_id:
+                        raise ValueError("每条命令都要属于一台目标机器")
+                    conn.execute(
+                        """
+                        INSERT INTO steps (plan_id, host_id, position, kind, command, local_path, remote_path)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (plan_id, host_id, index, kind, str(step.get("command") or ""), str(step.get("localPath") or ""), str(step.get("remotePath") or ""), str(step.get("note") or "")),
+                    )
+        self.send_json({"id": plan_id})
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        parts = [p for p in path.split("/") if p]
+        try:
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "hosts":
+                host_id = int(parts[2])
+                with connect() as conn:
+                    conn.execute("DELETE FROM steps WHERE host_id=?", (host_id,))
+                    conn.execute("DELETE FROM hosts WHERE id=?", (host_id,))
+                return self.send_json({"ok": True})
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "plans":
+                plan_id = int(parts[2])
+                with connect() as conn:
+                    conn.execute("DELETE FROM steps WHERE plan_id=?", (plan_id,))
+                    conn.execute("DELETE FROM plans WHERE id=?", (plan_id,))
+                return self.send_json({"ok": True})
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "steps":
+                with connect() as conn:
+                    conn.execute("DELETE FROM steps WHERE id=?", (int(parts[2]),))
+                return self.send_json({"ok": True})
+        except ValueError as exc:
+            return self.send_json({"error": str(exc)}, 400)
+        self.send_json({"error": "未找到"}, 404)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="服务部署分发系统")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8787)
+    args = parser.parse_args()
+    init_db()
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"部署分发系统已启动：http://{args.host}:{args.port}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

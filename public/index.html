@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>服务部署分发</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="top">
+    <div class="brand">部署分发</div>
+    <label class="plan-pick">方案
+      <select id="plan-select"></select>
+    </label>
+    <button id="new-plan" class="ghost">新建方案</button>
+    <button id="copy-plan" class="ghost">复制画布</button>
+    <button id="add-host">添加目标</button>
+    <button id="add-step">添加命令</button>
+    <button id="add-upload" class="ghost">添加上传</button>
+    <button id="add-download" class="ghost">添加下载</button>
+    <span class="spacer"></span>
+    <div class="zoom-bar">
+      <button id="zoom-out" class="ghost" type="button">缩小</button>
+      <span id="zoom-label">100%</span>
+      <button id="zoom-in" class="ghost" type="button">放大</button>
+    </div>
+    <button id="start-run">开始执行</button>
+    <button id="cancel-run" class="danger" disabled>停止</button>
+  </div>
+  <div id="banner"></div>
+  <div id="viewport">
+    <div id="board-scale"><div id="board"></div></div>
+  </div>
+  <aside id="panel" hidden>
+    <header>
+      <strong id="panel-title">编辑</strong>
+      <button id="panel-close" class="ghost">关闭</button>
+    </header>
+    <form id="panel-form"></form>
+  </aside>
+  <div id="viewer">
+    <header>
+      <strong id="viewer-title">远程命令</strong>
+      <span id="viewer-meta"></span>
+      <button id="viewer-close" class="ghost" type="button">关闭</button>
+    </header>
+    <div class="body"><pre id="viewer-log"></pre></div>
+  </div>  <script src="/static/app.js"></script>
+</body>
+</html>
