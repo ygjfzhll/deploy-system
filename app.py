@@ -336,8 +336,7 @@ def auth_options(host):
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", f"ConnectTimeout={app_setting('ssh_connect_timeout', 15)}",
-            "-o", "PreferredAuthentications=password",
-            "-o", "PubkeyAuthentication=no",
+            "-o", "PreferredAuthentications=publickey,password",
             "-o", "NumberOfPasswordPrompts=1",
         ]
     return [
