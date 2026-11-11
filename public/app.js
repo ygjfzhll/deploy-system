@@ -518,7 +518,7 @@ function buildGraph() {
         { label: "添加下载", run: () => addStep("download", host.id) },
         { label: "复制这条线", run: () => copyLine(host) },
         { label: disabled ? "启用这条线" : "禁用这条线", run: () => toggleLine(host, !disabled) },
-        { label: "删除这条线", run: () => deleteLine(host) },
+        { label: "删除主机", run: () => removeLine(host) },
       ],
     };
     if (disabled) hostNode.tone = "disabled";
@@ -685,11 +685,7 @@ function editHost(host) {
       body: JSON.stringify({ id: host.id, ...values, port: Number(values.port || 22), password: values.password || "" }),
     });
     await loadState();
-  }, async () => {
-    await api("/api/hosts/" + host.id, { method: "DELETE" });
-    document.querySelector("#panel").hidden = true;
-    await loadState();
-  });
+  }, () => removeLine(host));
 }
 
 async function toggleStep(step, disabled) {
@@ -989,9 +985,11 @@ async function runLineUnused(hostId) {
   }
 }
 
-async function deleteLine(host) {
-  if (!confirm("删除 " + host.name + " 这条线？这台机器和它自己的命令都会去掉。")) return;
-  await api("/api/hosts/" + host.id, { method: "DELETE" });
+async function removeLine(host) {
+  const plan = currentPlan();
+  if (!plan) return;
+  if (!confirm("从当前项目删除主机 " + host.name + "？只删除这个项目里的这条线和命令，其他项目不受影响。")) return;
+  await api("/api/plans/" + plan.id + "/hosts/" + host.id, { method: "DELETE" });
   document.querySelector("#panel").hidden = true;
   await loadState();
 }

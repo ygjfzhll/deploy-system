@@ -400,11 +400,7 @@ def public_state(user):
         runs = [run for run in rows(conn, "SELECT * FROM runs ORDER BY id DESC LIMIT 30") if run["plan_id"] in allowed_ids]
     busy = _current.get("run_id") is not None
     if not busy:
-        with _lock, connect() as conn:
-            conn.execute(
-                "UPDATE runs SET status='cancelled', message='任务已中断', finished_at=? WHERE status='running' AND finished_at IS NULL",
-                (now(),),
-            )
+        recover_interrupted_runs()
     return {"hosts": hosts, "plans": plans, "runs": runs, "busy": busy, "settings": {"maxParallelLines": max_parallel_lines()}}
 
 
@@ -551,6 +547,26 @@ def append_output(step_id, text):
             "UPDATE run_steps SET output = CONCAT(IFNULL(output, ''), ?) WHERE id=?",
             (text, step_id),
         )
+
+
+def recover_interrupted_runs():
+    if _current.get("run_id"):
+        return
+    with _lock, connect() as conn:
+        runs = rows(conn, "SELECT id FROM runs WHERE status='running'")
+        for run in runs:
+            conn.execute(
+                """
+                UPDATE run_steps
+                SET status='skipped', output=CONCAT(IFNULL(output, ''), '\n任务已中断\n'), finished_at=?
+                WHERE run_id=? AND status IN ('pending', 'running')
+                """,
+                (now(), run["id"]),
+            )
+            conn.execute(
+                "UPDATE runs SET status='cancelled', message='服务重启，任务已中断', finished_at=? WHERE id=? AND status='running'",
+                (now(), run["id"]),
+            )
 
 
 def finish_run(run_id, status, message):
@@ -1291,6 +1307,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(read_ai_config())
         if path == "/api/state":
             return self.send_json(public_state(user))
+        if len([p for p in path.split("/") if p]) == 4 and path.startswith("/api/hosts/") and path.endswith("/usage"):
+            host_id = int([p for p in path.split("/") if p][2])
+            with connect() as conn:
+                plans = rows(conn, """
+                    SELECT DISTINCT plans.id, plans.name
+                    FROM plans
+                    JOIN plan_hosts ON plan_hosts.plan_id = plans.id
+                    WHERE plan_hosts.host_id=?
+                    ORDER BY plans.id
+                """, (host_id,))
+            return self.send_json({"plans": plans})
         if path.startswith("/api/lines/"):
             from urllib.parse import parse_qs
             try:
@@ -2036,10 +2063,23 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         parts = [p for p in path.split("/") if p]
         try:
+            if len(parts) == 5 and parts[0] == "api" and parts[1] == "plans" and parts[3] == "hosts":
+                plan_id = int(parts[2])
+                host_id = int(parts[4])
+                if not can_plan_for(self.user, plan_id):
+                    return self.send_json({"error": "没有这个画布的权限"}, 403)
+                with connect() as conn:
+                    conn.execute("DELETE FROM steps WHERE plan_id=? AND host_id=?", (plan_id, host_id))
+                    conn.execute("DELETE FROM line_flags WHERE plan_id=? AND host_id=?", (plan_id, host_id))
+                    conn.execute("DELETE FROM plan_hosts WHERE plan_id=? AND host_id=?", (plan_id, host_id))
+                return self.send_json({"ok": True})
             if len(parts) == 3 and parts[0] == "api" and parts[1] == "hosts":
+                if not self.user.get("is_admin"):
+                    return self.send_json({"error": "只有管理员可以删除主机"}, 403)
                 host_id = int(parts[2])
                 with connect() as conn:
                     conn.execute("DELETE FROM steps WHERE host_id=?", (host_id,))
+                    conn.execute("DELETE FROM line_flags WHERE host_id=?", (host_id,))
                     conn.execute("DELETE FROM plan_hosts WHERE host_id=?", (host_id,))
                     conn.execute("DELETE FROM hosts WHERE id=?", (host_id,))
                 return self.send_json({"ok": True})
@@ -2076,6 +2116,7 @@ def main():
     parser.add_argument("--port", type=int, default=8787)
     args = parser.parse_args()
     init_db()
+    recover_interrupted_runs()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"部署分发系统已启动：http://{args.host}:{args.port}")
     server.serve_forever()
