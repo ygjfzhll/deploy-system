@@ -226,10 +226,14 @@ function nodeElement(node) {
       button.type = "button";
       button.className = action.label.includes("删除") ? "menu-btn danger" : "menu-btn";
       button.textContent = action.label;
-      button.onclick = (event) => {
-        event.stopPropagation();
-        action.run();
-      };
+      if (action.disabled) {
+        button.disabled = true;
+      } else {
+        button.onclick = (event) => {
+          event.stopPropagation();
+          action.run();
+        };
+      }
       bar.append(button);
     }
     el.append(hint, bar);
@@ -256,7 +260,8 @@ function nodeElement(node) {
     const origX = node.x;
     const origY = node.y;
     let moved = false;
-    const alongLine = node.kind === "upload" || node.kind === "download";
+    document.body.classList.add("dragging-node");
+    const alongLine = !!(node.stepId && (node.kind === "upload" || node.kind === "download" || node.kind === "remote" || node.kind === "local"));
     const move = (ev) => {
       const dx = ev.clientX - startX;
       const dy = ev.clientY - startY;
@@ -272,6 +277,7 @@ function nodeElement(node) {
     const up = async () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
+      document.body.classList.remove("dragging-node");
       if (!moved) return;
       el.dataset.dragged = "1";
       localStorage.setItem("deploy-node-pos", JSON.stringify(positions));
@@ -323,6 +329,11 @@ async function reorderLine(node) {
   after.splice(at, 0, node.stepId);
   const before = steps.map((step) => step.id);
   if (before.join(",") === after.join(",")) return;
+  const newIndex = after.findIndex((id) => String(id) === String(node.stepId));
+  const lineY = hostNode ? hostNode.y : node.y;
+  const lineX = hostNode ? hostNode.x : 360;
+  positions["step-keep-" + node.stepId] = { x: lineX + 340 + Math.max(0, newIndex) * 290, y: lineY };
+  localStorage.setItem("deploy-node-pos", JSON.stringify(positions));
   await api("/api/steps/reorder", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -367,10 +378,16 @@ function lineStepsFor(host) {
   return [];
 }
 
+function disabledSkip(step) {
+  return step.status === "skipped" && String(step.output || "").includes("已禁用");
+}
+
 function resultState(steps, inThisRun) {
   if (!inThisRun || !steps.length) return { tone: "", title: "未执行", sub: "这条线还没开始" };
-  const errored = steps.some((step) => step.status === "failed" || step.status === "skipped");
-  const allSuccess = steps.every((step) => step.status === "success");
+  const active = steps.filter((step) => !disabledSkip(step));
+  if (!active.length) return { tone: "success", title: "成功", sub: "禁用的步骤已跳过" };
+  const errored = active.some((step) => step.status === "failed" || step.status === "skipped");
+  const allSuccess = active.every((step) => step.status === "success");
   if (allSuccess) return { tone: "success", title: "成功", sub: "这条线的命令都已完成" };
   if (errored) return { tone: "failed", title: "失败", sub: steps.some((step) => step.status === "failed") ? "有命令报错" : "执行未完成已退出" };
   return { tone: "", title: "未执行", sub: "还没走到这里" };
@@ -417,19 +434,23 @@ function applyZoom() {
   localStorage.setItem("deploy-zoom", String(zoom));
 }
 
+let wireFrame = 0;
 function redrawWires() {
-  const board = document.querySelector("#board");
-  const svg = board && board.querySelector("svg.wires");
-  if (!svg || !graph) return;
-  const width = Math.max(1100, ...graph.nodes.map((node) => node.x + 320));
-  const height = Math.max(640, ...graph.nodes.map((node) => node.y + 240));
-  board.style.width = width + "px";
-  board.style.height = height + "px";
-  applyZoom();
-  svg.setAttribute("width", width);
-  svg.setAttribute("height", height);
-  svg.replaceChildren();
-  for (const [from, to, tone] of graph.edges) curve(svg, from, to, tone);
+  if (wireFrame) return;
+  wireFrame = requestAnimationFrame(() => {
+    wireFrame = 0;
+    const board = document.querySelector("#board");
+    const svg = board && board.querySelector("svg.wires");
+    if (!svg || !graph) return;
+    const width = Math.max(1100, ...graph.nodes.map((node) => node.x + 320));
+    const height = Math.max(640, ...graph.nodes.map((node) => node.y + 240));
+    board.style.width = width + "px";
+    board.style.height = height + "px";
+    svg.setAttribute("width", width);
+    svg.setAttribute("height", height);
+    svg.replaceChildren();
+    for (const [from, to, tone] of graph.edges) curve(svg, from, to, tone);
+  });
 }
 
 function curve(svg, from, to, tone) {
@@ -460,6 +481,9 @@ function buildGraph() {
     sub: plan ? plan.steps.length + " 个命令 · " + state.hosts.length + " 台机器" : "点击新建项目",
     tone: "root",
     onClick: () => editPlanName(),
+    actions: [
+      { label: "刷新所有线", disabled: runInProgress(), run: () => refreshAllLines().catch((error) => alert(error.message)) },
+    ],
   };
   nodes.push(place(root));
   let hostY = 28;
@@ -489,7 +513,8 @@ function buildGraph() {
     const failed = hostSteps.some((step) => step.status === "failed");
     const running = hostSteps.some((step) => step.status === "running");
     const done = hostSteps.length && hostSteps.every((step) => step.status === "success" || step.status === "skipped");
-    const lineDone = hostSteps.length && hostSteps.every((step) => step.status === "success");
+    const activeSteps = hostSteps.filter((step) => !disabledSkip(step));
+    const lineDone = hostSteps.length && activeSteps.every((step) => step.status === "success");
     if (!disabled && failed) hostNode.tone = "failed";
     else if (!disabled && running) hostNode.tone = "running";
     else if (!disabled && lineDone) hostNode.tone = "success";
@@ -498,11 +523,14 @@ function buildGraph() {
     nodes.push(place(hostNode));
     edges.push([root, hostNode, hostNode.tone]);
     let previous = hostNode;
-    const ownSteps = plan ? plan.steps.filter((step) => String(step.host_id) === String(host.id)) : [];
-    const sourceSteps = hostSteps.length ? hostSteps : ownSteps.map((step, index) => ({ ...step, position: index + 1, preview: step.command || step.local_path, status: "" }));
+    const ownSteps = (plan ? plan.steps.filter((step) => String(step.host_id) === String(host.id)) : []).slice().sort((a, b) => a.position - b.position || a.id - b.id);
+    const runById = {};
+    hostSteps.forEach((step) => { if (step.step_id) runById[step.step_id] = step; });
+    const sourceSteps = ownSteps.map((planStep, index) => runById[planStep.id] || { ...planStep, position: index + 1, preview: planStep.command || planStep.local_path, status: "" });
     sourceSteps.forEach((step, index) => {
-      const planStep = ownSteps.find((item) => item.id === (step.step_id || step.id)) || ownSteps[index];
+      const planStep = ownSteps[index];
       const commandText = liveCommand(step, planStep);
+      const stepOff = !!(planStep && Number(planStep.disabled));
       const child = {
         id: "step-" + host.id + "-" + index,
         x: 700 + index * 290,
@@ -510,11 +538,11 @@ function buildGraph() {
         hostId: host.id,
         stepId: planStep && planStep.id,
         kind: (planStep && planStep.kind) || step.kind,
-        kicker: (step.position || index + 1) + " · " + stepCaption(step, planStep),
+        kicker: (index + 1) + " · " + stepCaption(step, planStep),
         title: commandText,
         sub: step.remote_path || step.host_label || "",
-        tone: disabled ? "disabled" : (step.status && step.status !== "pending" ? step.status : ""),
-        badge: disabled ? "" : (step.status && step.status !== "pending" ? statusLabel[step.status] : ""),
+        tone: disabled || stepOff ? "disabled" : (step.status && step.status !== "pending" ? step.status : ""),
+        badge: stepOff ? "已禁用" : (disabled ? "" : (step.status && step.status !== "pending" ? statusLabel[step.status] : "")),
         log: step.output || "",
         onClick: () => editStep(planStep || step),
         actions: [
@@ -522,6 +550,7 @@ function buildGraph() {
           { label: "查看命令", run: () => openViewer({ title: "完整命令", kicker: "查看", sub: "", badge: "", log: commandText }) },
           { label: "查看执行结果", run: () => openViewer({ title: "执行结果", kicker: "结果", sub: "", badge: "", log: (step.output || "").replace(/本次未重复执行/g, "").trim() || "还没有执行结果" }) },
           { label: "编辑命令", run: () => editStep(planStep || step) },
+          { label: stepOff ? "启用这一步" : "禁用这一步", run: () => toggleStep(planStep, !stepOff) },
           { label: "删除这条命令", run: () => deleteCommand(planStep || step) },
         ],
       };
@@ -650,6 +679,19 @@ function editHost(host) {
   });
 }
 
+async function toggleStep(step, disabled) {
+  if (!step || !step.id) {
+    alert("没有找到这个步骤");
+    return;
+  }
+  await api("/api/steps/disabled", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: step.id, disabled }),
+  });
+  await loadState();
+}
+
 async function deleteCommand(step) {
   const plan = currentPlan();
   const current = plan && plan.steps.find((item) => Number(item.id) === Number(step.step_id || step.id));
@@ -672,8 +714,8 @@ function editStep(step) {
   ].concat(current.kind === "remote"
     ? [{ label: "这条线在目标机器上执行的命令", name: "command", type: "textarea", value: current.command }]
     : [
-        { label: "本机路径", name: "localPath", value: current.local_path },
-        { label: "目标路径", name: "remotePath", value: current.remote_path },
+        { label: current.kind === "upload" ? "本机文件或文件夹路径" : "本机路径", name: "localPath", value: current.local_path },
+        { label: current.kind === "upload" ? "目标目录" : "目标路径", name: "remotePath", value: current.remote_path },
       ]);
   openPanel(kindLabel[current.kind], fields, async (values) => {
     await api("/api/steps", {
@@ -829,6 +871,43 @@ function resetLineLayout(hostId) {
     positions["result-" + hostId] = { x: x + 340 + steps.length * 290, y };
   }
   localStorage.setItem("deploy-node-pos", JSON.stringify(positions));
+}
+
+function resetAllLineLayouts() {
+  const plan = currentPlan();
+  const hostIds = state.hosts.map((host) => String(host.id));
+  const stepIds = new Set((plan ? plan.steps : []).map((step) => String(step.id)));
+  Object.keys(positions).forEach((key) => {
+    if (key === "root") delete positions[key];
+    if (key.startsWith("step-keep-") && stepIds.has(key.slice("step-keep-".length))) delete positions[key];
+    hostIds.forEach((hostId) => {
+      if (key === "host-" + hostId || key === "result-" + hostId || key.startsWith("step-" + hostId + "-")) delete positions[key];
+    });
+  });
+  localStorage.setItem("deploy-node-pos", JSON.stringify(positions));
+}
+
+function runInProgress() {
+  if (runDetail && runDetail.status === "running") return true;
+  return !!(state && state.busy);
+}
+
+async function refreshAllLines() {
+  if (runInProgress()) return;
+  const plan = await ensurePlan();
+  for (const host of state.hosts) {
+    await api("/api/line-flags", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ planId: Number(plan.id), hostId: Number(host.id), forceRun: true }),
+    });
+    const previous = lineView[host.id] || lineView[String(host.id)] || {};
+    lineStatus[host.id] = [];
+    lineView[host.id] = { steps: [], cleared: true, finishedAt: previous.finishedAt || "" };
+  }
+  saveView();
+  resetAllLineLayouts();
+  draw();
 }
 
 async function refreshLine(host) {

@@ -256,6 +256,7 @@ pre.log {
   cursor: pointer;
 }
 .menu-btn:hover { background: #f4f7fb; }
+.menu-btn:disabled { color: #98a2b3; background: #f2f4f7; cursor: default; }
 .menu-btn.danger { color: #c5342a; }
 .menu-btn.danger:hover { background: #fff1f0; }
 
@@ -397,3 +398,6 @@ pre.log {
 .user-row strong { width: 120px; }
 .grant-list { display: flex; flex-wrap: wrap; gap: 8px 14px; flex: 1; }
 .grant-list label { display: flex; gap: 6px; align-items: center; }
+
+body.dragging-node .node-actions { display: none !important; }
+body.dragging-node .node { cursor: grabbing; }

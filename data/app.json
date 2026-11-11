@@ -1,6 +1,6 @@
 {
   // 同时执行的线条数。其余的线会排队，最小为 1
-  "max_parallel_lines": 1,
+  "max_parallel_lines": 3,
 
   // 单条命令等待结果的最长时间，单位秒。超时后显示「命令结果超时」
   "command_timeout": 120,

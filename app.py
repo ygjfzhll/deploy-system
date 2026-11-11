@@ -267,6 +267,8 @@ def init_db():
             conn.execute("ALTER TABLE users ADD COLUMN is_admin TINYINT NOT NULL DEFAULT 0")
         if not column_exists(conn, "plans", "owner_id"):
             conn.execute("ALTER TABLE plans ADD COLUMN owner_id BIGINT NULL")
+        if not column_exists(conn, "steps", "disabled"):
+            conn.execute("ALTER TABLE steps ADD COLUMN disabled TINYINT NOT NULL DEFAULT 0")
         ensure_admin(conn)
         if not conn.execute("SELECT id FROM users WHERE is_admin=1 LIMIT 1").fetchone():
             conn.execute("UPDATE users SET is_admin=1 ORDER BY id LIMIT 1")
@@ -387,7 +389,14 @@ def public_state(user):
             )
             plan["disabledHostIds"] = [row["host_id"] for row in flags if row["plan_id"] == plan["id"]]
         runs = [run for run in rows(conn, "SELECT * FROM runs ORDER BY id DESC LIMIT 30") if run["plan_id"] in allowed_ids]
-    return {"hosts": hosts, "plans": plans, "runs": runs, "settings": {"maxParallelLines": max_parallel_lines()}}
+    busy = _current.get("run_id") is not None
+    if not busy:
+        with _lock, connect() as conn:
+            conn.execute(
+                "UPDATE runs SET status='cancelled', message='任务已中断', finished_at=? WHERE status='running' AND finished_at IS NULL",
+                (now(),),
+            )
+    return {"hosts": hosts, "plans": plans, "runs": runs, "busy": busy, "settings": {"maxParallelLines": max_parallel_lines()}}
 
 
 def latest_line(plan_id, host_id):
@@ -495,8 +504,9 @@ def build_argv(host, step):
         if host["identity_file"] and not (host.get("password") or "").strip():
             cmd.extend(["-i", host["identity_file"]])
         if kind == "upload":
+            cmd.insert(1, "-r")
             cmd.extend([local_path, remote])
-            preview = f"scp {local_path} {remote}"
+            preview = f"scp -r {local_path} {remote}"
         else:
             cmd.extend([remote, local_path])
             preview = f"scp {remote} {local_path}"
@@ -979,6 +989,8 @@ def start_run(plan_id, host_ids, from_step_id=None, max_parallel=None, user=None
                         "SELECT status FROM run_steps WHERE step_id=? ORDER BY id DESC LIMIT 1",
                         (step["id"],),
                     ).fetchone()
+                    if step.get("disabled"):
+                        continue
                     if not prev or prev["status"] != "success":
                         finished = False
                         break
@@ -1002,7 +1014,13 @@ def start_run(plan_id, host_ids, from_step_id=None, max_parallel=None, user=None
                 ).fetchone()
                 same_command = prev and (prev["preview"] or "") == preview
                 keep_success = (not force_run) and prev and prev["status"] == "success" and same_command and not (resume_at and step["position"] >= resume_at)
-                if (resume_at and step["position"] < resume_at) or keep_success:
+                if step.get("disabled"):
+                    status = "skipped"
+                    output = "已禁用，跳过"
+                    exit_code = 0
+                    started = now()
+                    finished = now()
+                elif (resume_at and step["position"] < resume_at) or keep_success:
                     status = "success"
                     output = (prev["output"] if prev and prev["output"] else "")
                     exit_code = 0
@@ -1184,6 +1202,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.copy_line(payload)
             if path == "/api/steps/reorder":
                 return self.reorder_steps(payload)
+            if path == "/api/steps/disabled":
+                return self.set_step_disabled(payload)
             if path == "/api/steps":
                 return self.save_step(payload)
             if path == "/api/runs":
@@ -1272,6 +1292,16 @@ class Handler(BaseHTTPRequestHandler):
                     "UPDATE steps SET position=? WHERE id=? AND plan_id=? AND host_id=?",
                     (index, step_id, plan_id, host_id),
                 )
+        self.send_json({"ok": True})
+
+    def set_step_disabled(self, payload):
+        step_id = int(payload.get("id") or 0)
+        disabled = 1 if payload.get("disabled") else 0
+        with connect() as conn:
+            step = conn.execute("SELECT plan_id FROM steps WHERE id=?", (step_id,)).fetchone()
+            if not step or not can_plan(conn, self.user, step["plan_id"]):
+                raise ValueError("没有这个步骤")
+            conn.execute("UPDATE steps SET disabled=? WHERE id=?", (disabled, step_id))
         self.send_json({"ok": True})
 
     def save_step(self, payload):
