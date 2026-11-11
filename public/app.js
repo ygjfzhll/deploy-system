@@ -501,8 +501,9 @@ function buildGraph() {
       actions: [
         { label: "刷新这条线", run: () => refreshLine(host) },
         { label: "执行这条线", run: () => runLine(host.id) },
-        { label: "加命令", run: () => addStep("remote", host.id) },
-        { label: "加上传", run: () => addStep("upload", host.id) },
+        { label: "添加命令", run: () => addStep("remote", host.id) },
+        { label: "添加上传", run: () => addStep("upload", host.id) },
+        { label: "添加下载", run: () => addStep("download", host.id) },
         { label: "复制这条线", run: () => copyLine(host) },
         { label: disabled ? "启用这条线" : "禁用这条线", run: () => toggleLine(host, !disabled) },
         { label: "删除这条线", run: () => deleteLine(host) },
@@ -845,9 +846,6 @@ async function addStep(kind, hostId) {
   }
 }
 
-document.querySelector("#add-step").onclick = () => addStep("remote");
-document.querySelector("#add-upload").onclick = () => addStep("upload");
-document.querySelector("#add-download").onclick = () => addStep("download");
 
 function resetLineLayout(hostId) {
   const plan = currentPlan();
