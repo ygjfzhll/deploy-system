@@ -2,8 +2,10 @@
 """Linux 部署分发控制台：配置目标后，用系统 ssh/scp 顺序执行，并记录状态。"""
 
 import argparse
+import hashlib
 import json
 import os
+import secrets
 import shlex
 import select
 import signal
@@ -64,6 +66,18 @@ def app_setting(name, default, minimum=1):
 
 def max_parallel_lines():
     return app_setting("max_parallel_lines", 6)
+
+
+def save_max_parallel_lines(value):
+    import re
+    value = max(1, int(value))
+    path = DATA / "app.json"
+    text = path.read_text(encoding="utf-8")
+    updated, count = re.subn(r'("max_parallel_lines"\s*:\s*)\d+', r"\g<1>" + str(value), text, count=1)
+    if count != 1:
+        raise ValueError("配置文件里没有并发数")
+    path.write_text(updated, encoding="utf-8")
+    return value
 
 
 
@@ -226,6 +240,36 @@ def init_db():
         ).fetchone()["n"]
         if not has_force:
             conn.execute("ALTER TABLE line_flags ADD COLUMN force_run TINYINT NOT NULL DEFAULT 0")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              username VARCHAR(64) NOT NULL,
+              password_hash VARCHAR(255) NOT NULL,
+              created_at VARCHAR(32) NOT NULL,
+              is_admin TINYINT NOT NULL DEFAULT 0,
+              UNIQUE KEY uniq_username (username)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            CREATE TABLE IF NOT EXISTS sessions (
+              token VARCHAR(64) PRIMARY KEY,
+              user_id BIGINT NOT NULL,
+              created_at VARCHAR(32) NOT NULL,
+              expires_at VARCHAR(32) NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            CREATE TABLE IF NOT EXISTS plan_access (
+              user_id BIGINT NOT NULL,
+              plan_id BIGINT NOT NULL,
+              PRIMARY KEY (user_id, plan_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """
+        )
+        if not column_exists(conn, "users", "is_admin"):
+            conn.execute("ALTER TABLE users ADD COLUMN is_admin TINYINT NOT NULL DEFAULT 0")
+        if not column_exists(conn, "plans", "owner_id"):
+            conn.execute("ALTER TABLE plans ADD COLUMN owner_id BIGINT NULL")
+        ensure_admin(conn)
+        if not conn.execute("SELECT id FROM users WHERE is_admin=1 LIMIT 1").fetchone():
+            conn.execute("UPDATE users SET is_admin=1 ORDER BY id LIMIT 1")
 
 
 def migrate_sqlite_if_needed(conn):
@@ -266,13 +310,74 @@ def rows(conn, sql, args=()):
     return [dict(r) for r in conn.execute(sql, args).fetchall()]
 
 
-def public_state():
+def column_exists(conn, table, column):
+    return conn.execute(
+        "SELECT COUNT(*) AS n FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?",
+        (table, column),
+    ).fetchone()["n"]
+
+
+def hash_password(password, salt=None, rounds=120000):
+    if salt is None:
+        salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), rounds).hex()
+    return f"pbkdf2_sha256${rounds}${salt}${digest}"
+
+
+def verify_password(password, stored):
+    try:
+        algo, rounds, salt, digest = stored.split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        return secrets.compare_digest(hash_password(password, salt, int(rounds)), stored)
+    except (ValueError, TypeError):
+        return False
+
+
+def ensure_admin(conn):
+    if conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]:
+        return
+    conn.execute(
+        "INSERT INTO users (username, password_hash, created_at, is_admin) VALUES (?, ?, ?, 1)",
+        ("admin", hash_password("admin"), now()),
+    )
+    print("已创建初始账号 admin，初始密码 admin。登录后请立即修改密码。")
+
+
+def can_plan(conn, user, plan_id):
+    if not user or not plan_id:
+        return False
+    if user.get("is_admin"):
+        return True
+    return conn.execute(
+        "SELECT plan_id FROM plan_access WHERE user_id=? AND plan_id=?",
+        (user["id"], int(plan_id)),
+    ).fetchone() is not None
+
+
+def grant_plan(conn, user_id, plan_id):
+    conn.execute(
+        "INSERT IGNORE INTO plan_access (user_id, plan_id) VALUES (?, ?)",
+        (int(user_id), int(plan_id)),
+    )
+
+
+def can_plan_for(user, plan_id):
+    with connect() as conn:
+        return can_plan(conn, user, plan_id)
+
+
+def public_state(user):
     with connect() as conn:
         hosts = rows(conn, "SELECT * FROM hosts ORDER BY id")
         for host in hosts:
             host["has_password"] = bool(host.get("password"))
             host.pop("password", None)
         plans = rows(conn, "SELECT * FROM plans ORDER BY id DESC")
+        if not user.get("is_admin"):
+            allowed = {row["plan_id"] for row in rows(conn, "SELECT plan_id FROM plan_access WHERE user_id=?", (user["id"],))}
+            plans = [plan for plan in plans if plan["id"] in allowed]
+        allowed_ids = {plan["id"] for plan in plans}
         flags = rows(conn, "SELECT plan_id, host_id FROM line_flags WHERE disabled=1")
         for plan in plans:
             plan["steps"] = rows(
@@ -281,8 +386,8 @@ def public_state():
                 (plan["id"],),
             )
             plan["disabledHostIds"] = [row["host_id"] for row in flags if row["plan_id"] == plan["id"]]
-        runs = rows(conn, "SELECT * FROM runs ORDER BY id DESC LIMIT 30")
-    return {"hosts": hosts, "plans": plans, "runs": runs}
+        runs = [run for run in rows(conn, "SELECT * FROM runs ORDER BY id DESC LIMIT 30") if run["plan_id"] in allowed_ids]
+    return {"hosts": hosts, "plans": plans, "runs": runs, "settings": {"maxParallelLines": max_parallel_lines()}}
 
 
 def latest_line(plan_id, host_id):
@@ -689,7 +794,7 @@ def run_host_line(run_id, items, hosts, steps):
     return failure_messages
 
 
-def execute_run(run_id):
+def execute_run(run_id, limit=None):
     with connect() as conn:
         items = rows(
             conn,
@@ -708,7 +813,7 @@ def execute_run(run_id):
         groups[host_id].append(item)
     failure_messages = []
     lock = threading.Lock()
-    limit = max_parallel_lines()
+    limit = max(1, int(limit or max_parallel_lines()))
     print(f"本次同时执行上限：{limit}", flush=True)
     slots = threading.Semaphore(limit)
 
@@ -820,7 +925,7 @@ def live_procs():
     return procs
 
 
-def start_run(plan_id, host_ids, from_step_id=None):
+def start_run(plan_id, host_ids, from_step_id=None, max_parallel=None, user=None):
     if _current["run_id"]:
         if live_procs():
             raise RuntimeError("已有任务正在执行")
@@ -832,7 +937,9 @@ def start_run(plan_id, host_ids, from_step_id=None):
     with connect() as conn:
         plan = conn.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
         if not plan:
-            raise ValueError("命令方案不存在")
+            raise ValueError("项目不存在")
+        if user is not None and not can_plan(conn, user, plan_id):
+            raise ValueError("没有这个画布的权限")
         disabled = {row["host_id"] for row in conn.execute("SELECT host_id FROM line_flags WHERE plan_id=? AND disabled=1", (plan_id,)).fetchall()}
         hosts = []
         for host_id in host_ids:
@@ -928,20 +1035,53 @@ def start_run(plan_id, host_ids, from_step_id=None):
             raise ValueError("已完成的线不会重复执行，请先点「刷新这条线」")
     _current["run_id"] = run_id
     _current["cancel"] = False
-    threading.Thread(target=execute_run, args=(run_id,), daemon=True).start()
+    if max_parallel is not None:
+        max_parallel = save_max_parallel_lines(max_parallel)
+    threading.Thread(target=execute_run, args=(run_id, max_parallel), daemon=True).start()
     return run_id
+
+
+
+def session_user(token):
+    if not token:
+        return None
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT users.id, users.username, users.is_admin
+            FROM sessions
+            JOIN users ON users.id = sessions.user_id
+            WHERE sessions.token=? AND sessions.expires_at>?
+            """,
+            (token, now()),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def read_session_token(header):
+    for part in (header or "").split(";"):
+        name, _, value = part.strip().partition("=")
+        if name == "deploy_session":
+            return value
+    return ""
+
+
+def session_cookie(token, max_age):
+    return f"deploy_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}"
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 
-    def send_json(self, payload, status=200):
+    def send_json(self, payload, status=200, headers=None):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            for key, value in headers or []:
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
@@ -962,8 +1102,18 @@ class Handler(BaseHTTPRequestHandler):
             if file.is_file() and file.resolve().parent == PUBLIC.resolve():
                 kind = "text/css; charset=utf-8" if name.endswith(".css") else "text/javascript; charset=utf-8"
                 return self.serve_file(file, kind)
+        if path == "/api/me":
+            user = self.current_user()
+            if not user:
+                return self.send_json({"error": "未登录"}, 401)
+            return self.send_json({"id": user["id"], "username": user["username"], "isAdmin": bool(user.get("is_admin"))})
+        user = self.require_user()
+        if not user:
+            return
+        if path == "/api/users":
+            return self.list_users()
         if path == "/api/state":
-            return self.send_json(public_state())
+            return self.send_json(public_state(user))
         if path.startswith("/api/lines/"):
             from urllib.parse import parse_qs
             try:
@@ -971,6 +1121,8 @@ class Handler(BaseHTTPRequestHandler):
                 plan_id = int(parse_qs(urlparse(self.path).query).get("planId", ["0"])[0])
             except ValueError:
                 return self.send_json({"error": "无效参数"}, 400)
+            if not can_plan_for(user, plan_id):
+                return self.send_json({"error": "没有这个画布的权限"}, 403)
             data = latest_line(plan_id, host_id)
             if data is None:
                 return self.send_json({"error": "目标不存在"}, 404)
@@ -983,6 +1135,8 @@ class Handler(BaseHTTPRequestHandler):
             data = run_detail(run_id)
             if not data:
                 return self.send_json({"error": "任务不存在"}, 404)
+            if not can_plan_for(user, data.get("plan_id")):
+                return self.send_json({"error": "没有这个画布的权限"}, 403)
             return self.send_json(data)
         self.send_json({"error": "未找到"}, 404)
 
@@ -1002,7 +1156,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         try:
-            payload = self.read_json()
+            payload = self.read_json() if path != "/api/logout" else {}
+            if path == "/api/login":
+                return self.login(payload)
+            if path == "/api/logout":
+                return self.logout()
+            if path == "/api/password":
+                user = self.require_user()
+                if not user:
+                    return
+                return self.change_password(user, payload)
+            if not self.require_user():
+                return
+            if path == "/api/users":
+                return self.create_user(payload)
+            if path == "/api/users/grants":
+                return self.save_grants(payload)
             if path == "/api/hosts":
                 return self.save_host(payload)
             if path == "/api/plans":
@@ -1013,13 +1182,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self.save_line_flag(payload)
             if path == "/api/lines/copy":
                 return self.copy_line(payload)
+            if path == "/api/steps/reorder":
+                return self.reorder_steps(payload)
             if path == "/api/steps":
                 return self.save_step(payload)
             if path == "/api/runs":
-                run_id = start_run(int(payload["planId"]), [int(x) for x in payload["hostIds"]], int(payload["fromStepId"]) if payload.get("fromStepId") else None)
+                run_id = start_run(int(payload["planId"]), [int(x) for x in payload["hostIds"]], int(payload["fromStepId"]) if payload.get("fromStepId") else None, int(payload["maxParallel"]) if payload.get("maxParallel") else None, self.user)
                 return self.send_json({"id": run_id})
             if path.endswith("/cancel") and path.startswith("/api/runs/"):
                 run_id = int(path.split("/")[3])
+                detail = run_detail(run_id)
+                if not detail or not can_plan_for(self.user, detail.get("plan_id")):
+                    return self.send_json({"error": "没有这个画布的权限"}, 403)
                 if _current["run_id"] != run_id:
                     return self.send_json({"error": "这个任务没有在执行"}, 400)
                 _current["cancel"] = True
@@ -1080,14 +1254,36 @@ class Handler(BaseHTTPRequestHandler):
                 host_id = cur.lastrowid
         self.send_json({"id": host_id})
 
+    def reorder_steps(self, payload):
+        plan_id = int(payload.get("planId") or 0)
+        host_id = int(payload.get("hostId") or 0)
+        step_ids = [int(item) for item in payload.get("stepIds") or []]
+        if not can_plan_for(self.user, plan_id):
+            raise ValueError("没有这个画布的权限")
+        with connect() as conn:
+            existing = [row["id"] for row in conn.execute(
+                "SELECT id FROM steps WHERE plan_id=? AND host_id=? ORDER BY position, id",
+                (plan_id, host_id),
+            ).fetchall()]
+            if sorted(existing) != sorted(step_ids):
+                raise ValueError("这条线上的命令已变化，请刷新后再拖动")
+            for index, step_id in enumerate(step_ids, start=1):
+                conn.execute(
+                    "UPDATE steps SET position=? WHERE id=? AND plan_id=? AND host_id=?",
+                    (index, step_id, plan_id, host_id),
+                )
+        self.send_json({"ok": True})
+
     def save_step(self, payload):
         plan_id = int(payload.get("planId") or 0)
+        if not can_plan_for(self.user, plan_id):
+            raise ValueError("没有这个画布的权限")
         host_id = int(payload.get("hostId") or 0)
         kind = payload.get("kind")
         if kind not in ("remote", "upload", "download", "local"):
             raise ValueError("步骤类型不正确")
         if not plan_id or not host_id:
-            raise ValueError("请选择方案和对应的目标线")
+            raise ValueError("请选择项目和对应的主机")
         command = str(payload.get("command") or "")
         local_path = str(payload.get("localPath") or "")
         remote_path = str(payload.get("remotePath") or "")
@@ -1119,15 +1315,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def copy_plan(self, payload):
         plan_id = int(payload.get("id") or 0)
+        if not can_plan_for(self.user, plan_id):
+            raise ValueError("没有这个画布的权限")
         with connect() as conn:
             plan = conn.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
             if not plan:
-                raise ValueError("方案不存在")
+                raise ValueError("项目不存在")
             cur = conn.execute(
-                "INSERT INTO plans (name, created_at) VALUES (?, ?)",
-                (plan["name"] + " 副本", now()),
+                "INSERT INTO plans (name, owner_id, created_at) VALUES (?, ?, ?)",
+                (plan["name"] + " 副本", self.user["id"], now()),
             )
             new_id = cur.lastrowid
+            grant_plan(conn, self.user["id"], new_id)
             steps = conn.execute("SELECT * FROM steps WHERE plan_id=? ORDER BY position, id", (plan_id,)).fetchall()
             for step in steps:
                 conn.execute(
@@ -1147,6 +1346,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def copy_line(self, payload):
         plan_id = int(payload.get("planId") or 0)
+        if not can_plan_for(self.user, plan_id):
+            raise ValueError("没有这个画布的权限")
         host_id = int(payload.get("hostId") or 0)
         with connect() as conn:
             host = conn.execute("SELECT * FROM hosts WHERE id=?", (host_id,)).fetchone()
@@ -1185,9 +1386,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def save_line_flag(self, payload):
         plan_id = int(payload.get("planId") or 0)
+        if not can_plan_for(self.user, plan_id):
+            raise ValueError("没有这个画布的权限")
         host_id = int(payload.get("hostId") or 0)
         if not plan_id or not host_id:
-            raise ValueError("请选择方案和目标线")
+            raise ValueError("请选择项目和主机")
         with connect() as conn:
             current = conn.execute(
                 "SELECT disabled, force_run FROM line_flags WHERE plan_id=? AND host_id=?",
@@ -1214,19 +1417,22 @@ class Handler(BaseHTTPRequestHandler):
         name = payload.get("name", "").strip()
         steps = payload.get("steps")
         if not name:
-            raise ValueError("方案名称不能为空")
+            raise ValueError("项目名称不能为空")
         with connect() as conn:
             if payload.get("id"):
                 plan_id = int(payload["id"])
+                if not can_plan(conn, self.user, plan_id):
+                    raise ValueError("没有这个画布的权限")
                 conn.execute("UPDATE plans SET name=? WHERE id=?", (name, plan_id))
                 if steps is not None:
                     conn.execute("DELETE FROM steps WHERE plan_id=?", (plan_id,))
             else:
                 cur = conn.execute(
-                    "INSERT INTO plans (name, created_at) VALUES (?, ?)",
-                    (name, now()),
+                    "INSERT INTO plans (name, owner_id, created_at) VALUES (?, ?, ?)",
+                    (name, self.user["id"], now()),
                 )
                 plan_id = cur.lastrowid
+                grant_plan(conn, self.user["id"], plan_id)
             if steps is not None:
                 for index, step in enumerate(steps, start=1):
                     kind = step.get("kind")
@@ -1242,7 +1448,132 @@ class Handler(BaseHTTPRequestHandler):
                     )
         self.send_json({"id": plan_id})
 
+    def current_user(self):
+        return session_user(read_session_token(self.headers.get("Cookie")))
+
+    def require_user(self):
+        user = self.current_user()
+        if not user:
+            self.send_json({"error": "未登录"}, 401)
+            return None
+        self.user = user
+        return user
+
+    def login(self, payload):
+        username = str(payload.get("username") or "").strip()
+        password = str(payload.get("password") or "")
+        with connect() as conn:
+            row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+            if not row or not verify_password(password, row["password_hash"]):
+                return self.send_json({"error": "用户名或密码错误"}, 401)
+            token = secrets.token_urlsafe(32)
+            expires = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + 7 * 24 * 3600))
+            conn.execute(
+                "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                (token, row["id"], now(), expires),
+            )
+        return self.send_json(
+            {"id": row["id"], "username": row["username"], "isAdmin": bool(row.get("is_admin"))},
+            headers=[("Set-Cookie", session_cookie(token, 7 * 24 * 3600))],
+        )
+
+    def logout(self):
+        token = read_session_token(self.headers.get("Cookie"))
+        if token:
+            with connect() as conn:
+                conn.execute("DELETE FROM sessions WHERE token=?", (token,))
+        return self.send_json({"ok": True}, headers=[("Set-Cookie", session_cookie("", 0))])
+
+    def change_password(self, user, payload):
+        current = str(payload.get("current") or "")
+        password = str(payload.get("password") or "")
+        if len(password) < 6:
+            raise ValueError("新密码至少 6 位")
+        with connect() as conn:
+            row = conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+            if not row or not verify_password(current, row["password_hash"]):
+                return self.send_json({"error": "当前密码不正确"}, 400)
+            conn.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(password), user["id"]))
+            conn.execute("DELETE FROM sessions WHERE user_id=?", (user["id"],))
+        return self.send_json({"ok": True}, headers=[("Set-Cookie", session_cookie("", 0))])
+
+    def list_users(self):
+        if not self.user.get("is_admin"):
+            return self.send_json({"error": "只有管理员可以管理用户"}, 403)
+        with connect() as conn:
+            users = rows(conn, "SELECT id, username, is_admin, created_at FROM users ORDER BY id")
+            grants = rows(conn, "SELECT user_id, plan_id FROM plan_access")
+            plans = rows(conn, "SELECT id, name FROM plans ORDER BY id DESC")
+        by_user = {}
+        for grant in grants:
+            by_user.setdefault(grant["user_id"], []).append(grant["plan_id"])
+        for user in users:
+            user["isAdmin"] = bool(user.pop("is_admin"))
+            user["planIds"] = by_user.get(user["id"], [])
+        return self.send_json({"users": users, "plans": plans})
+
+    def create_user(self, payload):
+        if not self.user.get("is_admin"):
+            return self.send_json({"error": "只有管理员可以管理用户"}, 403)
+        username = str(payload.get("username") or "").strip()
+        password = str(payload.get("password") or "")
+        plan_ids = [int(x) for x in payload.get("planIds") or []]
+        if not username:
+            raise ValueError("请填写用户名")
+        if len(password) < 6:
+            raise ValueError("密码至少 6 位")
+        with connect() as conn:
+            if conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone():
+                raise ValueError("用户名已存在")
+            cur = conn.execute(
+                "INSERT INTO users (username, password_hash, created_at, is_admin) VALUES (?, ?, ?, 0)",
+                (username, hash_password(password), now()),
+            )
+            user_id = cur.lastrowid
+            for plan_id in plan_ids:
+                if conn.execute("SELECT id FROM plans WHERE id=?", (plan_id,)).fetchone():
+                    grant_plan(conn, user_id, plan_id)
+        return self.send_json({"id": user_id})
+
+    def save_grants(self, payload):
+        if not self.user.get("is_admin"):
+            return self.send_json({"error": "只有管理员可以管理用户"}, 403)
+        user_id = int(payload.get("userId") or 0)
+        plan_ids = [int(x) for x in payload.get("planIds") or []]
+        with connect() as conn:
+            user = conn.execute("SELECT id, is_admin FROM users WHERE id=?", (user_id,)).fetchone()
+            if not user:
+                raise ValueError("用户不存在")
+            if user["is_admin"]:
+                raise ValueError("管理员可以打开全部画布，不用单独授权")
+            conn.execute("DELETE FROM plan_access WHERE user_id=?", (user_id,))
+            for plan_id in plan_ids:
+                if conn.execute("SELECT id FROM plans WHERE id=?", (plan_id,)).fetchone():
+                    grant_plan(conn, user_id, plan_id)
+        return self.send_json({"ok": True})
+
+    def delete_user(self, user_id):
+        if not self.user.get("is_admin"):
+            return self.send_json({"error": "只有管理员可以管理用户"}, 403)
+        if user_id == self.user["id"]:
+            raise ValueError("不能删除当前登录用户")
+        with connect() as conn:
+            user = conn.execute("SELECT id, is_admin FROM users WHERE id=?", (user_id,)).fetchone()
+            if not user:
+                raise ValueError("用户不存在")
+            if user["is_admin"]:
+                admins = conn.execute("SELECT COUNT(*) AS n FROM users WHERE is_admin=1").fetchone()["n"]
+                if admins <= 1:
+                    raise ValueError("至少保留一个管理员")
+            conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+            conn.execute("DELETE FROM plan_access WHERE user_id=?", (user_id,))
+            conn.execute("UPDATE plans SET owner_id=NULL WHERE owner_id=?", (user_id,))
+            conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+        return self.send_json({"ok": True})
+
     def do_DELETE(self):
+        if not self.require_user():
+            return
         path = urlparse(self.path).path
         parts = [p for p in path.split("/") if p]
         try:
@@ -1252,14 +1583,25 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("DELETE FROM steps WHERE host_id=?", (host_id,))
                     conn.execute("DELETE FROM hosts WHERE id=?", (host_id,))
                 return self.send_json({"ok": True})
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "users":
+                return self.delete_user(int(parts[2]))
             if len(parts) == 3 and parts[0] == "api" and parts[1] == "plans":
                 plan_id = int(parts[2])
                 with connect() as conn:
+                    plan = conn.execute("SELECT owner_id FROM plans WHERE id=?", (plan_id,)).fetchone()
+                    if not plan:
+                        raise ValueError("项目不存在")
+                    if not self.user.get("is_admin") and plan["owner_id"] != self.user["id"]:
+                        return self.send_json({"error": "只能删除自己创建的画布"}, 403)
                     conn.execute("DELETE FROM steps WHERE plan_id=?", (plan_id,))
+                    conn.execute("DELETE FROM plan_access WHERE plan_id=?", (plan_id,))
                     conn.execute("DELETE FROM plans WHERE id=?", (plan_id,))
                 return self.send_json({"ok": True})
             if len(parts) == 3 and parts[0] == "api" and parts[1] == "steps":
                 with connect() as conn:
+                    step = conn.execute("SELECT plan_id FROM steps WHERE id=?", (int(parts[2]),)).fetchone()
+                    if not step or not can_plan(conn, self.user, step["plan_id"]):
+                        return self.send_json({"error": "没有这个画布的权限"}, 403)
                     conn.execute("DELETE FROM steps WHERE id=?", (int(parts[2]),))
                 return self.send_json({"ok": True})
         except ValueError as exc:

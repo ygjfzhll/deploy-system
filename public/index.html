@@ -7,29 +7,54 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+  <div id="login-screen" hidden>
+    <form id="login-form">
+      <h1>部署分发</h1>
+      <p>请登录后继续</p>
+      <label>用户名<input name="username" autocomplete="username" required></label>
+      <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit">登录</button>
+      <div id="login-error"></div>
+    </form>
+  </div>
+  <div id="app-shell" hidden>
+  <aside id="side">
+    <div class="side-head">
+      <div class="brand">部署分发</div>
+      <button id="side-hide" class="ghost" type="button">隐藏</button>
+    </div>
+    <div class="side-label">项目</div>
+    <select id="plan-select"></select>
+    <button id="new-plan" class="ghost menu" type="button">新建项目</button>
+    <button id="copy-plan" class="ghost menu" type="button">复制画布</button>
+    <button id="add-host" class="ghost menu" type="button">添加主机</button>
+    <button id="add-step" class="ghost menu" type="button">添加命令</button>
+    <button id="add-upload" class="ghost menu" type="button">添加上传</button>
+    <button id="add-download" class="ghost menu" type="button">添加下载</button>
+    <div class="side-gap"></div>
+    <div class="side-label">账号</div>
+    <div id="who"></div>
+    <button id="manage-users" class="ghost menu" type="button" hidden>用户和画布</button>
+    <button id="change-password" class="ghost menu" type="button">修改密码</button>
+    <button id="logout" class="ghost menu" type="button">退出</button>
+  </aside>
+  <div id="workspace">
   <div class="top">
-    <div class="brand">部署分发</div>
-    <label class="plan-pick">方案
-      <select id="plan-select"></select>
-    </label>
-    <button id="new-plan" class="ghost">新建方案</button>
-    <button id="copy-plan" class="ghost">复制画布</button>
-    <button id="add-host">添加目标</button>
-    <button id="add-step">添加命令</button>
-    <button id="add-upload" class="ghost">添加上传</button>
-    <button id="add-download" class="ghost">添加下载</button>
+    <button id="side-show" class="ghost" type="button" hidden>菜单</button>
     <span class="spacer"></span>
     <div class="zoom-bar">
       <button id="zoom-out" class="ghost" type="button">缩小</button>
       <span id="zoom-label">100%</span>
       <button id="zoom-in" class="ghost" type="button">放大</button>
     </div>
+    <label class="parallel-pick">并发<input id="max-parallel" type="number" min="1" value="2"></label>
     <button id="start-run">开始执行</button>
     <button id="cancel-run" class="danger" disabled>停止</button>
   </div>
   <div id="banner"></div>
   <div id="viewport">
     <div id="board-scale"><div id="board"></div></div>
+  </div>
   </div>
   <aside id="panel" hidden>
     <header>
@@ -45,6 +70,22 @@
       <button id="viewer-close" class="ghost" type="button">关闭</button>
     </header>
     <div class="body"><pre id="viewer-log"></pre></div>
-  </div>  <script src="/static/app.js"></script>
+  </div>  </div>
+  <div id="user-screen" hidden>
+    <div class="user-card">
+      <header>
+        <strong>用户和画布权限</strong>
+        <button id="user-close" class="ghost" type="button">关闭</button>
+      </header>
+      <form id="user-create">
+        <input name="username" placeholder="新用户名" required>
+        <input name="password" type="password" placeholder="初始密码，至少 6 位" required>
+        <button type="submit">添加用户</button>
+      </form>
+      <p class="side-label">勾选该用户可以打开的画布。用户自己新建的画布会自动出现在这里。</p>
+      <div id="user-list"></div>
+    </div>
+  </div>
+  <script src="/static/app.js"></script>
 </body>
 </html>

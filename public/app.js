@@ -1,5 +1,5 @@
 let state = { hosts: [], plans: [], runs: [] };
-let planId = null;
+let planId = localStorage.getItem("deploy-plan-id");
 let runDetail = null;
 let lineStatus = {};
 let lineView = {};
@@ -25,8 +25,31 @@ const statusLabel = { pending: "等待", running: "执行中", success: "成功"
 async function api(url, options) {
   const response = await fetch(url, options);
   const data = await response.json().catch(() => ({}));
+  if (response.status === 401 && !url.startsWith("/api/login")) {
+    showLogin();
+    throw new Error(data.error || "未登录");
+  }
   if (!response.ok) throw new Error(data.error || "请求失败");
   return data;
+}
+
+function showLogin() {
+  document.querySelector("#login-screen").hidden = false;
+  document.querySelector("#app-shell").hidden = true;
+  if (timer) {
+    clearTimeout(timer);
+    timer = null;
+  }
+}
+
+let currentUser = null;
+function showApp(user) {
+  currentUser = user;
+  document.querySelector("#login-screen").hidden = true;
+  document.querySelector("#app-shell").hidden = false;
+  document.querySelector("#who").textContent = user.username;
+  document.querySelector("#login-error").textContent = "";
+  document.querySelector("#manage-users").hidden = !user.isAdmin;
 }
 
 function currentPlan() {
@@ -45,7 +68,7 @@ function openPanel(title, fields, onSubmit, onDelete) {
     const input = document.createElement(field.type === "textarea" ? "textarea" : "input");
     input.name = field.name;
     input.value = field.value || "";
-    if (field.name === "password") input.type = "password";
+    if (field.name === "password" || field.type === "password") input.type = "password";
     if (field.placeholder) input.placeholder = field.placeholder;
     if (field.type === "number") input.type = "number";
     form.append(label, input);
@@ -106,8 +129,8 @@ function stepsPayload(plan, extra) {
 
 async function ensurePlan() {
   if (currentPlan()) return currentPlan();
-  const name = prompt("方案名称", "发布流程");
-  if (!name) throw new Error("请先建立方案");
+  const name = prompt("项目名称", "发布流程");
+  if (!name) throw new Error("请先建立项目");
   const saved = await api("/api/plans", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -233,6 +256,7 @@ function nodeElement(node) {
     const origX = node.x;
     const origY = node.y;
     let moved = false;
+    const alongLine = node.kind === "upload" || node.kind === "download";
     const move = (ev) => {
       const dx = ev.clientX - startX;
       const dy = ev.clientY - startY;
@@ -241,15 +265,19 @@ function nodeElement(node) {
       node.y = origY + dy / zoom;
       el.style.left = node.x + "px";
       el.style.top = node.y + "px";
-      positions[node.id] = { x: node.x, y: node.y };
+      if (alongLine && node.stepId) positions["step-keep-" + node.stepId] = { x: node.x, y: node.y };
+      else positions[node.id] = { x: node.x, y: node.y };
       redrawWires();
     };
-    const up = () => {
+    const up = async () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
-      if (moved) {
-        el.dataset.dragged = "1";
-        localStorage.setItem("deploy-node-pos", JSON.stringify(positions));
+      if (!moved) return;
+      el.dataset.dragged = "1";
+      localStorage.setItem("deploy-node-pos", JSON.stringify(positions));
+      if (alongLine && node.stepId) {
+        try { await reorderLine(node); }
+        catch (error) { alert(error.message); await loadState(); }
       }
     };
     window.addEventListener("pointermove", move);
@@ -266,8 +294,45 @@ function nodeElement(node) {
   return el;
 }
 
+async function reorderLine(node) {
+  const plan = currentPlan();
+  const steps = plan.steps.filter((step) => String(step.host_id) === String(node.hostId));
+  const others = steps.filter((step) => String(step.id) !== String(node.stepId));
+  const hostNode = graph.nodes.find((item) => item.id === "host-" + node.hostId);
+  const anchors = [{ x: hostNode ? hostNode.x + 115 : 0, y: hostNode ? hostNode.y + 28 : node.y, at: 0 }];
+  others.forEach((step, index) => {
+    const visual = graph.nodes.find((item) => String(item.stepId) === String(step.id));
+    anchors.push({
+      x: visual ? visual.x + 115 : 700 + index * 290,
+      y: visual ? visual.y + 28 : node.y,
+      at: index + 1,
+    });
+  });
+  const dropX = node.x + 115;
+  const dropY = node.y + 28;
+  let at = 0;
+  let best = Infinity;
+  anchors.forEach((anchor) => {
+    const dist = Math.hypot(anchor.x - dropX, anchor.y - dropY);
+    if (dist < best) {
+      best = dist;
+      at = anchor.at;
+    }
+  });
+  const after = others.map((step) => step.id);
+  after.splice(at, 0, node.stepId);
+  const before = steps.map((step) => step.id);
+  if (before.join(",") === after.join(",")) return;
+  await api("/api/steps/reorder", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ planId: Number(plan.id), hostId: Number(node.hostId), stepIds: after }),
+  });
+  await loadState();
+}
+
 function place(node) {
-  const saved = positions[node.id];
+  const saved = (node.stepId && positions["step-keep-" + node.stepId]) || positions[node.id];
   if (saved) {
     node.x = saved.x;
     node.y = saved.y;
@@ -383,15 +448,16 @@ function curve(svg, from, to, tone) {
 
 function buildGraph() {
   const plan = currentPlan();
+  if (!plan) return { nodes: [], edges: [], width: 1100, height: 640 };
   const nodes = [];
   const edges = [];
   const root = {
     id: "root",
     x: 48,
     y: 72,
-    kicker: "方案",
-    title: plan ? plan.name : "还没有方案",
-    sub: plan ? plan.steps.length + " 个命令 · " + state.hosts.length + " 台机器" : "点击新建方案",
+    kicker: "项目",
+    title: plan ? plan.name : "还没有项目",
+    sub: plan ? plan.steps.length + " 个命令 · " + state.hosts.length + " 台机器" : "点击新建项目",
     tone: "root",
     onClick: () => editPlanName(),
   };
@@ -401,6 +467,7 @@ function buildGraph() {
     const disabled = !!(plan && (plan.disabledHostIds || []).some((id) => Number(id) === Number(host.id)));
     const hostNode = {
       id: "host-" + host.id,
+      hostId: host.id,
       x: 360,
       y: hostY,
       kicker: "目标机器",
@@ -440,19 +507,22 @@ function buildGraph() {
         id: "step-" + host.id + "-" + index,
         x: 700 + index * 290,
         y: hostY,
+        hostId: host.id,
+        stepId: planStep && planStep.id,
+        kind: (planStep && planStep.kind) || step.kind,
         kicker: (step.position || index + 1) + " · " + stepCaption(step, planStep),
         title: commandText,
         sub: step.remote_path || step.host_label || "",
         tone: disabled ? "disabled" : (step.status && step.status !== "pending" ? step.status : ""),
         badge: disabled ? "" : (step.status && step.status !== "pending" ? statusLabel[step.status] : ""),
         log: step.output || "",
-        onClick: () => editStep(ownSteps[index] || step),
+        onClick: () => editStep(planStep || step),
         actions: [
-          ...(step.status === "failed" ? [{ label: "从这里继续", run: () => runLine(host.id, step.step_id || (ownSteps[index] && ownSteps[index].id)) }] : []),
+          ...(step.status === "failed" ? [{ label: "从这里继续", run: () => runLine(host.id, (planStep && planStep.id) || step.step_id) }] : []),
           { label: "查看命令", run: () => openViewer({ title: "完整命令", kicker: "查看", sub: "", badge: "", log: commandText }) },
           { label: "查看执行结果", run: () => openViewer({ title: "执行结果", kicker: "结果", sub: "", badge: "", log: (step.output || "").replace(/本次未重复执行/g, "").trim() || "还没有执行结果" }) },
-          { label: "编辑命令", run: () => editStep(ownSteps[index] || step) },
-          { label: "删除这条命令", run: () => deleteCommand(ownSteps[index] || step) },
+          { label: "编辑命令", run: () => editStep(planStep || step) },
+          { label: "删除这条命令", run: () => deleteCommand(planStep || step) },
         ],
       };
       nodes.push(place(child));
@@ -531,10 +601,14 @@ function renderSelect() {
   }
   if (previous && state.plans.some((plan) => String(plan.id) === String(previous))) select.value = previous;
   planId = select.value || null;
+  if (planId) localStorage.setItem("deploy-plan-id", planId);
+  else localStorage.removeItem("deploy-plan-id");
 }
 
 async function loadState() {
   state = await api("/api/state");
+  const parallel = state.settings && state.settings.maxParallelLines;
+  if (parallel) document.querySelector("#max-parallel").value = parallel;
   renderSelect();
   restoreView();
   draw();
@@ -543,14 +617,15 @@ async function loadState() {
 function editPlanName() {
   const plan = currentPlan();
   if (!plan) return ensurePlan().then(draw).catch((error) => alert(error.message));
-  openPanel("方案", [{ label: "名称", name: "name", value: plan.name }], async (values) => {
+  const owns = currentUser && (currentUser.isAdmin || String(plan.owner_id) === String(currentUser.id));
+  openPanel("项目", [{ label: "名称", name: "name", value: plan.name }], async (values) => {
     await savePlan({ id: plan.id, name: values.name });
-  }, async () => {
+  }, owns ? async () => {
     await api("/api/plans/" + plan.id, { method: "DELETE" });
     planId = null;
     document.querySelector("#panel").hidden = true;
     await loadState();
-  });
+  } : null);
 }
 
 function editHost(host) {
@@ -579,7 +654,7 @@ async function deleteCommand(step) {
   const plan = currentPlan();
   const current = plan && plan.steps.find((item) => Number(item.id) === Number(step.step_id || step.id));
   if (!current) {
-    alert("没有找到这条命令");
+    alert("没有找到这个节点，请刷新后再删除");
     return;
   }
   if (!confirm("删除这条命令？同一条线上的其他命令会保留。")) return;
@@ -634,6 +709,7 @@ function editStep(step) {
 
 document.querySelector("#plan-select").onchange = (event) => {
   planId = event.target.value;
+  if (planId) localStorage.setItem("deploy-plan-id", planId);
   runDetail = null;
   restoreView();
   draw();
@@ -731,10 +807,35 @@ document.querySelector("#add-step").onclick = () => addStep("remote");
 document.querySelector("#add-upload").onclick = () => addStep("upload");
 document.querySelector("#add-download").onclick = () => addStep("download");
 
+function resetLineLayout(hostId) {
+  const plan = currentPlan();
+  const hostNode = graph && graph.nodes.find((item) => item.id === "host-" + hostId);
+  const savedHost = positions["host-" + hostId];
+  const y = hostNode ? hostNode.y : savedHost && savedHost.y;
+  const x = hostNode ? hostNode.x : savedHost ? savedHost.x : 360;
+  const prefix = "step-" + hostId + "-";
+  Object.keys(positions).forEach((key) => {
+    if (key === "host-" + hostId || key === "result-" + hostId || key.startsWith(prefix)) delete positions[key];
+  });
+  const steps = plan ? plan.steps.filter((step) => String(step.host_id) === String(hostId)) : [];
+  steps.forEach((step) => delete positions["step-keep-" + step.id]);
+  if (y !== undefined && y !== null) {
+    positions["host-" + hostId] = { x, y };
+    steps.forEach((step, index) => {
+      const pos = { x: x + 340 + index * 290, y };
+      positions[prefix + index] = pos;
+      positions["step-keep-" + step.id] = pos;
+    });
+    positions["result-" + hostId] = { x: x + 340 + steps.length * 290, y };
+  }
+  localStorage.setItem("deploy-node-pos", JSON.stringify(positions));
+}
+
 async function refreshLine(host) {
   try {
     const plan = currentPlan();
-    if (!plan) throw new Error("请先选择方案");
+    if (!plan) throw new Error("请先选择项目");
+    resetLineLayout(host.id);
     await api("/api/line-flags", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -753,7 +854,7 @@ async function refreshLine(host) {
 async function runLine(hostId, fromStepId) {
   try {
     const plan = await ensurePlan();
-    const body = { planId: Number(plan.id), hostIds: [Number(hostId)] };
+    const body = { planId: Number(plan.id), hostIds: [Number(hostId)], maxParallel: Math.max(1, Number(document.querySelector("#max-parallel").value) || 1) };
     if (fromStepId) body.fromStepId = Number(fromStepId);
     const result = await api("/api/runs", {
       method: "POST",
@@ -791,10 +892,11 @@ document.querySelector("#start-run").onclick = async () => {
   try {
     const plan = await ensurePlan();
     if (!state.hosts.length) throw new Error("请先添加目标机器");
+    const maxParallel = Math.max(1, Number(document.querySelector("#max-parallel").value) || 1);
     const result = await api("/api/runs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ planId: Number(plan.id), hostIds: state.hosts.map((host) => host.id) }),
+      body: JSON.stringify({ planId: Number(plan.id), hostIds: state.hosts.map((host) => host.id), maxParallel }),
     });
     watchRun(result.id);
   } catch (error) {
@@ -866,7 +968,137 @@ document.querySelector("#viewport").addEventListener("wheel", (event) => {
   applyZoom();
 }, { passive: false });
 applyZoom();
-loadState().catch((error) => alert(error.message));
+document.querySelector("#login-form").onsubmit = async (event) => {
+  event.preventDefault();
+  const values = Object.fromEntries(new FormData(event.target).entries());
+  try {
+    const user = await api("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(values),
+    });
+    showApp(user);
+    await loadState();
+  } catch (error) {
+    document.querySelector("#login-error").textContent = error.message;
+  }
+};
+document.querySelector("#logout").onclick = async () => {
+  await api("/api/logout", { method: "POST" });
+  showLogin();
+};
+document.querySelector("#change-password").onclick = () => {
+  openPanel("修改密码", [
+    { name: "current", label: "当前密码", type: "password" },
+    { name: "password", label: "新密码", type: "password" },
+  ], async (values) => {
+    await api("/api/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(values),
+    });
+    showLogin();
+    alert("密码已修改，请重新登录");
+  });
+};
+
+function applySide() {
+  const hidden = localStorage.getItem("deploy-side") === "hidden";
+  document.querySelector("#side").hidden = hidden;
+  document.querySelector("#side-show").hidden = !hidden;
+}
+document.querySelector("#side-hide").onclick = () => {
+  localStorage.setItem("deploy-side", "hidden");
+  applySide();
+};
+document.querySelector("#side-show").onclick = () => {
+  localStorage.removeItem("deploy-side");
+  applySide();
+};
+applySide();
+
+async function loadUsers() {
+  const data = await api("/api/users");
+  const list = document.querySelector("#user-list");
+  list.innerHTML = "";
+  for (const user of data.users) {
+    const row = document.createElement("div");
+    row.className = "user-row";
+    const name = document.createElement("strong");
+    name.textContent = user.username + (user.isAdmin ? "（管理员）" : "");
+    row.append(name);
+    if (user.isAdmin) {
+      const note = document.createElement("span");
+      note.textContent = "可以打开全部画布";
+      row.append(note);
+    } else {
+      const grants = document.createElement("div");
+      grants.className = "grant-list";
+      for (const plan of data.plans) {
+        const label = document.createElement("label");
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.value = plan.id;
+        box.checked = user.planIds.includes(plan.id);
+        label.append(box, document.createTextNode(plan.name));
+        grants.append(label);
+      }
+      const save = document.createElement("button");
+      save.type = "button";
+      save.className = "ghost";
+      save.textContent = "保存权限";
+      save.onclick = async () => {
+        const planIds = [...grants.querySelectorAll("input:checked")].map((box) => Number(box.value));
+        await api("/api/users/grants", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ userId: user.id, planIds }),
+        });
+        alert("已保存");
+      };
+      row.append(grants, save);
+    }
+    if (!user.isAdmin) {
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "danger";
+      del.textContent = "删除";
+      del.onclick = async () => {
+        if (!confirm("删除用户 " + user.username + "？")) return;
+        await api("/api/users/" + user.id, { method: "DELETE" });
+        await loadUsers();
+      };
+      row.append(del);
+    }
+    list.append(row);
+  }
+}
+document.querySelector("#manage-users").onclick = async () => {
+  document.querySelector("#user-screen").hidden = false;
+  try { await loadUsers(); } catch (error) { alert(error.message); }
+};
+document.querySelector("#user-close").onclick = () => { document.querySelector("#user-screen").hidden = true; };
+document.querySelector("#user-create").onsubmit = async (event) => {
+  event.preventDefault();
+  const values = Object.fromEntries(new FormData(event.target).entries());
+  try {
+    await api("/api/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(values),
+    });
+    event.target.reset();
+    await loadUsers();
+  } catch (error) {
+    alert(error.message);
+  }
+};
+
+api("/api/me").then(async (user) => {
+  showApp(user);
+  await loadState();
+}).catch(() => showLogin());
+
 
 function openViewer(node) {
   const viewer = document.querySelector("#viewer");
