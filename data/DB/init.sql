@@ -1,6 +1,9 @@
--- deploy_system MySQL 初始化
+-- deploy_system 离线初始化
+-- 用法：mysql -u用户 -p < data/DB/init.sql
 -- 库名：deploy_system
 -- 字符集：utf8mb4
+-- 默认管理员：admin / admin
+-- 新建项目默认没有主机，主机在项目里添加后写入 plan_hosts
 
 CREATE DATABASE IF NOT EXISTS deploy_system
   DEFAULT CHARACTER SET utf8mb4
@@ -95,8 +98,12 @@ CREATE TABLE IF NOT EXISTS plan_access (
   PRIMARY KEY (user_id, plan_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- 默认管理员。仅当不存在 admin 时插入。
--- 用户名 admin，密码 admin。程序启动时如果用户表为空，也会创建同一账号。
+CREATE TABLE IF NOT EXISTS plan_hosts (
+  plan_id BIGINT NOT NULL,
+  host_id BIGINT NOT NULL,
+  PRIMARY KEY (plan_id, host_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 INSERT INTO users (username, password_hash, created_at, is_admin)
 SELECT 'admin',
        'pbkdf2_sha256$120000$18e2bda917d31093fe1d70399cc6278b$0e244819c0418599fcf5fdf0450176d30acb76a5ce1b9e7b8a59f3e6419425c8',
@@ -104,10 +111,3 @@ SELECT 'admin',
        1
 FROM DUAL
 WHERE NOT EXISTS (SELECT 1 FROM users WHERE username = 'admin');
-
-CREATE TABLE IF NOT EXISTS plan_hosts (
-  plan_id BIGINT NOT NULL,
-  host_id BIGINT NOT NULL,
-  PRIMARY KEY (plan_id, host_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
