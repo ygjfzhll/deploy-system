@@ -56,6 +56,12 @@ function currentPlan() {
   return state.plans.find((plan) => String(plan.id) === String(planId));
 }
 
+function planHosts() {
+  const plan = currentPlan();
+  const ids = new Set((plan && plan.hostIds || []).map((id) => String(id)));
+  return state.hosts.filter((host) => ids.has(String(host.id)));
+}
+
 function openPanel(title, fields, onSubmit, onDelete) {
   const panel = document.querySelector("#panel");
   panel.hidden = false;
@@ -127,20 +133,22 @@ function stepsPayload(plan, extra) {
   return steps;
 }
 
-async function ensurePlan() {
-  if (currentPlan()) return currentPlan();
+async function createPlan() {
   const name = prompt("项目名称", "发布流程");
   if (!name) throw new Error("请先建立项目");
   const saved = await api("/api/plans", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name,
-    }),
+    body: JSON.stringify({ name }),
   });
   planId = saved.id;
   await loadState();
   return currentPlan();
+}
+
+async function ensurePlan() {
+  if (currentPlan()) return currentPlan();
+  return createPlan();
 }
 
 function nodeElement(node) {
@@ -478,16 +486,19 @@ function buildGraph() {
     y: 72,
     kicker: "项目",
     title: plan ? plan.name : "还没有项目",
-    sub: plan ? plan.steps.length + " 个命令 · " + state.hosts.length + " 台机器" : "点击新建项目",
+    sub: plan ? plan.steps.length + " 个命令 · " + planHosts().length + " 台机器" : "点击新建项目",
     tone: "root",
     onClick: () => editPlanName(),
     actions: [
       { label: "刷新所有线", disabled: runInProgress(), run: () => refreshAllLines().catch((error) => alert(error.message)) },
+      { label: "一键禁用", run: () => setAllLines(true) },
+      { label: "一键启用", run: () => setAllLines(false) },
+      { label: "AI 起草", run: () => openAiDraft() },
     ],
   };
   nodes.push(place(root));
   let hostY = 28;
-  for (const host of state.hosts) {
+  for (const host of planHosts()) {
     const disabled = !!(plan && (plan.disabledHostIds || []).some((id) => Number(id) === Number(host.id)));
     const hostNode = {
       id: "host-" + host.id,
@@ -564,7 +575,7 @@ function buildGraph() {
     const rowHeight = Math.max(34, ...rowIds.map((id) => (sizes[id] && sizes[id].h) || 58));
     hostY += rowHeight + 14;
   }
-  if (!state.hosts.length && plan) {
+  if (!planHosts().length && plan) {
     let previous = root;
     plan.steps.forEach((step, index) => {
       const child = {
@@ -784,6 +795,21 @@ async function copyLine(host) {
   await loadState();
 }
 
+async function setAllLines(disabled) {
+  try {
+    const plan = currentPlan();
+    if (!plan) throw new Error("请先选择项目");
+    await api("/api/line-flags/all", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ planId: Number(plan.id), disabled }),
+    });
+    await loadState();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
 async function toggleLine(host, disabled) {
   const plan = await ensurePlan();
   await api("/api/line-flags", {
@@ -794,9 +820,13 @@ async function toggleLine(host, disabled) {
   await loadState();
 }
 
-document.querySelector("#new-plan").onclick = () => ensurePlan().then(draw).catch((error) => alert(error.message));
+document.querySelector("#new-plan").onclick = () => createPlan().then(draw).catch((error) => alert(error.message));
 
 document.querySelector("#add-host").onclick = () => {
+  if (!currentPlan()) {
+    alert("请先选择或新建项目");
+    return;
+  }
   openPanel("新目标", [
     { label: "名称", name: "name", placeholder: "应用服务器" },
     { label: "IP 地址", name: "ip", placeholder: "10.0.0.12" },
@@ -808,7 +838,7 @@ document.querySelector("#add-host").onclick = () => {
     await api("/api/hosts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...values, port: Number(values.port || 22), password: values.password || "" }),
+      body: JSON.stringify({ ...values, port: Number(values.port || 22), password: values.password || "", planId: currentPlan() && currentPlan().id }),
     });
     await loadState();
   });
@@ -873,7 +903,7 @@ function resetLineLayout(hostId) {
 
 function resetAllLineLayouts() {
   const plan = currentPlan();
-  const hostIds = state.hosts.map((host) => String(host.id));
+  const hostIds = planHosts().map((host) => String(host.id));
   const stepIds = new Set((plan ? plan.steps : []).map((step) => String(step.id)));
   Object.keys(positions).forEach((key) => {
     if (key === "root") delete positions[key];
@@ -893,7 +923,7 @@ function runInProgress() {
 async function refreshAllLines() {
   if (runInProgress()) return;
   const plan = await ensurePlan();
-  for (const host of state.hosts) {
+  for (const host of planHosts()) {
     await api("/api/line-flags", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -968,12 +998,13 @@ async function deleteLine(host) {
 document.querySelector("#start-run").onclick = async () => {
   try {
     const plan = await ensurePlan();
-    if (!state.hosts.length) throw new Error("请先添加目标机器");
+    const hosts = planHosts();
+    if (!hosts.length) throw new Error("请先添加目标机器");
     const maxParallel = Math.max(1, Number(document.querySelector("#max-parallel").value) || 1);
     const result = await api("/api/runs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ planId: Number(plan.id), hostIds: state.hosts.map((host) => host.id), maxParallel }),
+      body: JSON.stringify({ planId: Number(plan.id), hostIds: hosts.map((host) => host.id), maxParallel }),
     });
     watchRun(result.id);
   } catch (error) {
@@ -1209,3 +1240,182 @@ document.querySelector("#viewer-close").onclick = () => {
     moving = false;
   });
 })();
+let aiDraft = null;
+const kindText = { remote: "命令", upload: "上传", download: "下载" };
+function openAiDraft() {
+  aiDraft = null;
+  document.querySelector("#ai-preview").innerHTML = "";
+  document.querySelector("#ai-save").hidden = true;
+  document.querySelector("#ai-screen").hidden = false;
+}
+document.querySelector("#ai-close").onclick = () => { document.querySelector("#ai-screen").hidden = true; };
+(function enableAiDrag() {
+  const screen = document.querySelector("#ai-screen");
+  const card = screen.querySelector(".user-card");
+  card.addEventListener("pointerdown", (event) => {
+    if (event.target.closest("button, textarea, input, a")) return;
+    const rect = card.getBoundingClientRect();
+    const offsetX = event.clientX - rect.left;
+    const offsetY = event.clientY - rect.top;
+    card.setPointerCapture(event.pointerId);
+    screen.classList.add("dragging");
+    const move = (ev) => {
+      const x = Math.min(window.innerWidth - 120, Math.max(8, ev.clientX - offsetX));
+      const y = Math.min(window.innerHeight - 80, Math.max(8, ev.clientY - offsetY));
+      card.style.left = x + "px";
+      card.style.top = y + "px";
+      card.style.right = "auto";
+      card.style.transform = "none";
+    };
+    const up = (ev) => {
+      screen.classList.remove("dragging");
+      try { card.releasePointerCapture(ev.pointerId); } catch (error) {}
+      card.removeEventListener("pointermove", move);
+      card.removeEventListener("pointerup", up);
+    };
+    card.addEventListener("pointermove", move);
+    card.addEventListener("pointerup", up);
+  });
+})();
+document.querySelector("#ai-generate").onclick = async () => {
+  try {
+    const plan = await ensurePlan();
+    const button = document.querySelector("#ai-generate");
+    button.disabled = true;
+    aiDraft = await api("/api/ai/draft", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ planId: Number(plan.id), prompt: document.querySelector("#ai-prompt").value }),
+    });
+    const box = document.querySelector("#ai-preview");
+    box.innerHTML = "";
+    const summary = document.createElement("p");
+    summary.textContent = aiDraft.summary || "草稿已生成";
+    box.append(summary);
+    (aiDraft.warnings || []).forEach((warning) => {
+      const line = document.createElement("p");
+      line.textContent = warning;
+      box.append(line);
+    });
+    aiDraft.lines.forEach((line) => {
+      const title = document.createElement("strong");
+      title.textContent = line.hostName;
+      box.append(title);
+      line.steps.forEach((step, index) => {
+        const item = document.createElement("div");
+        const text = step.kind === "remote" ? step.command : step.localPath + " -> " + step.remotePath;
+        item.textContent = line.action === "disable"
+          ? "禁用：" + (step.note || text)
+          : (index + 1) + ". " + (kindText[step.kind] || step.kind) + (step.note ? " " + step.note : "") + "：" + text;
+        box.append(item);
+      });
+    });
+    document.querySelector("#ai-save").hidden = false;
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    document.querySelector("#ai-generate").disabled = false;
+  }
+};
+document.querySelector("#ai-save").onclick = async () => {
+  if (!aiDraft) return;
+  try {
+    await api("/api/ai/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ planId: Number(aiDraft.planId), lines: aiDraft.lines }),
+    });
+    document.querySelector("#ai-screen").hidden = true;
+    await loadState();
+    alert("已保存。复制出来的是整条新线，在画布底部。如需取消，可再次打开 AI 起草并点撤回上次保存。");
+  } catch (error) {
+    alert(error.message);
+  }
+};
+document.querySelector("#ai-undo").onclick = async () => {
+  try {
+    const plan = currentPlan();
+    if (!plan) throw new Error("请先选择项目");
+    await api("/api/ai/undo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ planId: Number(plan.id) }),
+    });
+    await loadState();
+    alert("已撤回上次 AI 保存");
+  } catch (error) {
+    alert(error.message);
+  }
+};
+
+document.querySelector("#ai-config").onclick = async () => {
+  const cfg = await api("/api/ai/config");
+  const form = document.querySelector("#ai-config-form");
+  form.base_url.value = cfg.base_url || "";
+  form.api_key.value = cfg.api_key || "";
+  form.model.value = cfg.model || "";
+  form.timeout.value = cfg.timeout || 60;
+  document.querySelector("#ai-config-screen").hidden = false;
+};
+document.querySelector("#ai-config-close").onclick = () => {
+  document.querySelector("#ai-config-screen").hidden = true;
+};
+document.querySelector("#ai-config-form").onsubmit = async (event) => {
+  event.preventDefault();
+  const values = Object.fromEntries(new FormData(event.target).entries());
+  try {
+    await api("/api/ai/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(values),
+    });
+    document.querySelector("#ai-config-screen").hidden = true;
+  } catch (error) {
+    alert(error.message);
+  }
+};
+
+function renderPlanManager() {
+  const list = document.querySelector("#plan-list");
+  list.innerHTML = "";
+  if (!state.plans.length) {
+    list.textContent = "还没有项目";
+    return;
+  }
+  state.plans.forEach((plan) => {
+    const row = document.createElement("div");
+    row.className = "user-row";
+    const name = document.createElement("strong");
+    name.textContent = plan.name;
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "danger";
+    del.textContent = "删除";
+    del.onclick = async () => {
+      const typed = prompt("请输入项目名称以确认删除", "");
+      if (typed === null) return;
+      if (typed.trim() !== plan.name) {
+        alert("项目名称不一致，未删除");
+        return;
+      }
+      try {
+        await api("/api/plans/" + plan.id, { method: "DELETE" });
+        if (String(planId) === String(plan.id)) planId = null;
+        await loadState();
+        renderPlanManager();
+      } catch (error) {
+        alert(error.message);
+      }
+    };
+    row.append(name, del);
+    list.append(row);
+  });
+}
+document.querySelector("#manage-plans").onclick = async () => {
+  await loadState();
+  renderPlanManager();
+  document.querySelector("#plan-screen").hidden = false;
+};
+document.querySelector("#plan-close").onclick = () => {
+  document.querySelector("#plan-screen").hidden = true;
+};

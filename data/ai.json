@@ -1,0 +1,6 @@
+{
+  "base_url": "http://47.91.2.252:8317/v1",
+  "api_key": "sk-SuGAAfzsyGi6L0EJU6nRGFE0B0xw6v4YfHRGg1wpAIyylGqSPmmskGBO0itdrMEdfffff",
+  "model": "grok-4.7",
+  "timeout": 60
+}

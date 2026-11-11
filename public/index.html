@@ -26,12 +26,14 @@
     <div class="side-label">项目</div>
     <select id="plan-select"></select>
     <button id="new-plan" class="ghost menu" type="button">新建项目</button>
+    <button id="manage-plans" class="ghost menu" type="button">项目管理</button>
     <button id="copy-plan" class="ghost menu" type="button">复制画布</button>
     <button id="add-host" class="ghost menu" type="button">添加主机</button>
     <div class="side-gap"></div>
     <div class="side-label">账号</div>
     <div id="who"></div>
     <button id="manage-users" class="ghost menu" type="button" hidden>用户和画布</button>
+    <button id="ai-config" class="ghost menu" type="button">AI集成</button>
     <button id="change-password" class="ghost menu" type="button">修改密码</button>
     <button id="logout" class="ghost menu" type="button">退出</button>
   </aside>
@@ -81,6 +83,43 @@
       </form>
       <p class="side-label">勾选该用户可以打开的画布。用户自己新建的画布会自动出现在这里。</p>
       <div id="user-list"></div>
+    </div>
+  </div>
+  <div id="plan-screen" hidden>
+    <div class="user-card">
+      <header>
+        <strong>项目管理</strong>
+        <button id="plan-close" class="ghost" type="button">关闭</button>
+      </header>
+      <p class="side-label">删除时需要输入完整的项目名称。只会删除该项目及其流水线，不会删除主机。</p>
+      <div id="plan-list"></div>
+    </div>
+  </div>
+  <div id="ai-config-screen" hidden>
+    <form id="ai-config-form" class="user-card">
+      <header>
+        <strong>AI集成</strong>
+        <button id="ai-config-close" class="ghost" type="button">关闭</button>
+      </header>
+      <label>接口地址<input name="base_url" placeholder="https://api.openai.com/v1" required></label>
+      <label>密钥<input name="api_key" type="password" required></label>
+      <label>模型<input name="model" placeholder="gpt-4o-mini" required></label>
+      <label>超时秒数<input name="timeout" type="number" min="10" value="60"></label>
+      <button type="submit">保存</button>
+    </form>
+  </div>
+  <div id="ai-screen" hidden>
+    <div class="user-card">
+      <header>
+        <strong>AI 起草流水线</strong>
+        <button id="ai-close" class="ghost" type="button">关闭</button>
+      </header>
+      <p class="side-label">只生成草稿，确认后才写入当前项目，不会执行。</p>
+      <textarea id="ai-prompt" rows="5" placeholder="例如：把 /tmp/video 上传到所有主机的 /opt/video，然后解压并重启服务"></textarea>
+      <button id="ai-generate" type="button">生成草稿</button>
+      <div id="ai-preview"></div>
+      <button id="ai-save" type="button" hidden>保存到当前项目</button>
+      <button id="ai-undo" class="ghost" type="button">撤回上次保存</button>
     </div>
   </div>
   <script src="/static/app.js"></script>

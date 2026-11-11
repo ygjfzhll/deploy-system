@@ -401,3 +401,20 @@ pre.log {
 
 body.dragging-node .node-actions { display: none !important; }
 body.dragging-node .node { cursor: grabbing; }
+
+#ai-screen { position: fixed; inset: 0; z-index: 31; pointer-events: none; }
+#ai-screen[hidden] { display: none; }
+#ai-prompt { width: 100%; min-height: 110px; }
+#ai-preview { display: grid; gap: 6px; color: var(--ink); }
+#ai-preview p { margin: 0; color: var(--muted); }
+
+#ai-config-screen { position: fixed; inset: 0; z-index: 32; display: grid; place-items: center; background: rgba(28, 36, 48, 0.28); }
+#ai-config-screen[hidden] { display: none; }
+#ai-config-form label { display: grid; gap: 6px; color: var(--muted); font-size: 13px; }
+
+#plan-screen { position: fixed; inset: 0; z-index: 32; display: grid; place-items: center; background: rgba(28, 36, 48, 0.28); }
+#plan-screen[hidden] { display: none; }
+
+#ai-screen .user-card { pointer-events: auto; position: fixed; left: calc(50% - 360px); top: 72px; width: min(720px, calc(100% - 32px)); z-index: 32; cursor: grab; }
+#ai-screen textarea, #ai-screen input, #ai-screen button, #ai-screen a { cursor: auto; }
+#ai-screen.dragging header { cursor: grabbing; }

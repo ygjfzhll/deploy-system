@@ -23,6 +23,7 @@ DB_PATH = DATA / "app.sqlite"
 PUBLIC = ROOT / "public"
 
 _lock = threading.Lock()
+_ai_undo = {}
 _current = {"run_id": None, "proc": None, "procs": [], "cancel": False}
 
 
@@ -261,6 +262,11 @@ def init_db():
               plan_id BIGINT NOT NULL,
               PRIMARY KEY (user_id, plan_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            CREATE TABLE IF NOT EXISTS plan_hosts (
+              plan_id BIGINT NOT NULL,
+              host_id BIGINT NOT NULL,
+              PRIMARY KEY (plan_id, host_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """
         )
         if not column_exists(conn, "users", "is_admin"):
@@ -269,6 +275,8 @@ def init_db():
             conn.execute("ALTER TABLE plans ADD COLUMN owner_id BIGINT NULL")
         if not column_exists(conn, "steps", "disabled"):
             conn.execute("ALTER TABLE steps ADD COLUMN disabled TINYINT NOT NULL DEFAULT 0")
+        if conn.execute("SELECT COUNT(*) AS n FROM plan_hosts").fetchone()["n"] == 0:
+            conn.execute("INSERT INTO plan_hosts (plan_id, host_id) SELECT plans.id, hosts.id FROM plans JOIN hosts")
         ensure_admin(conn)
         if not conn.execute("SELECT id FROM users WHERE is_admin=1 LIMIT 1").fetchone():
             conn.execute("UPDATE users SET is_admin=1 ORDER BY id LIMIT 1")
@@ -388,6 +396,7 @@ def public_state(user):
                 (plan["id"],),
             )
             plan["disabledHostIds"] = [row["host_id"] for row in flags if row["plan_id"] == plan["id"]]
+            plan["hostIds"] = [row["host_id"] for row in rows(conn, "SELECT host_id FROM plan_hosts WHERE plan_id=? ORDER BY host_id", (plan["id"],))]
         runs = [run for run in rows(conn, "SELECT * FROM runs ORDER BY id DESC LIMIT 30") if run["plan_id"] in allowed_ids]
     busy = _current.get("run_id") is not None
     if not busy:
@@ -1060,6 +1069,152 @@ def start_run(plan_id, host_ids, from_step_id=None, max_parallel=None, user=None
 
 
 
+
+def read_ai_config():
+    path = DATA / "ai.json"
+    if not path.is_file():
+        return {"base_url": "", "api_key": "", "model": "", "timeout": 60}
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    return {
+        "base_url": str(cfg.get("base_url") or ""),
+        "api_key": str(cfg.get("api_key") or ""),
+        "model": str(cfg.get("model") or ""),
+        "timeout": int(cfg.get("timeout") or 60),
+    }
+
+
+def load_ai_config():
+    cfg = read_ai_config()
+    if not cfg["base_url"].strip() or not cfg["api_key"].strip() or not cfg["model"].strip():
+        raise RuntimeError("请先在左侧「AI集成」里填写接口地址、密钥和模型")
+    return cfg
+
+
+def ai_complete(messages):
+    import urllib.request
+    import urllib.error
+    cfg = load_ai_config()
+    url = str(cfg["base_url"]).rstrip("/") + "/chat/completions"
+    body = json.dumps({"model": cfg["model"], "temperature": 0.2, "messages": messages}, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"Authorization": "Bearer " + str(cfg["api_key"]), "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=int(cfg.get("timeout") or 60)) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        raise RuntimeError("AI 接口调用失败：" + detail)
+    return data["choices"][0]["message"]["content"]
+
+
+def parse_ai_json(text):
+    raw = text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1]
+        raw = raw.rsplit("```", 1)[0]
+    raw = raw.strip()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        begin = raw.find("{")
+        finish = raw.rfind("}")
+        if begin < 0 or finish <= begin:
+            raise ValueError("AI 没有返回可识别的草稿")
+        data = json.loads(raw[begin:finish + 1])
+    if isinstance(data, list):
+        return {"summary": "", "lines": data}
+    return data
+
+
+
+def chinese_number(text):
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    digits = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if text == "十":
+        return 10
+    if text.startswith("十"):
+        return 10 + digits.get(text[1:], 0)
+    if "十" in text:
+        left, right = text.split("十", 1)
+        return digits.get(left, 1) * 10 + digits.get(right, 0)
+    return digits.get(text)
+
+
+def chinese_index(prompt):
+    import re
+    matched = re.search(r"第\s*([0-9]+|[一二三四五六七八九十]+)\s*条", prompt)
+    return chinese_number(matched.group(1)) if matched else None
+
+
+def chinese_count(prompt):
+    import re
+    matched = re.search(r"复制\s*([0-9]+|[一二三四五六七八九十]+)\s*条", prompt)
+    return chinese_number(matched.group(1)) if matched else None
+
+
+def kind_name(value):
+    text = str(value or "").strip().lower()
+    if text in ("remote", "command", "cmd", "命令", "远程命令"):
+        return "remote"
+    if text in ("upload", "上传"):
+        return "upload"
+    if text in ("download", "下载"):
+        return "download"
+    return ""
+
+
+def resolve_host(line, hosts):
+    by_id = {int(host["id"]): host for host in hosts}
+    raw = line.get("hostId", line.get("host_id", line.get("host")))
+    text = str(raw or line.get("hostName") or line.get("name") or "").strip()
+    if text.isdigit() and int(text) in by_id:
+        return by_id[int(text)]
+    for index, host in enumerate(hosts, start=1):
+        if text in (str(index), "第%d条" % index, host["name"], host["ip"]):
+            return host
+    return None
+
+
+def normalize_draft(plan_id, draft, hosts):
+    lines = []
+    warnings = []
+    for line in draft.get("lines") or []:
+        host = resolve_host(line, hosts)
+        if not host:
+            warnings.append("有一条线没有对应主机，已忽略")
+            continue
+        host_id = int(host["id"])
+        steps = []
+        for step in line.get("steps") or []:
+            kind = kind_name(step.get("kind") or step.get("type"))
+            if not kind:
+                warnings.append(host["name"] + " 有不支持的步骤，已忽略")
+                continue
+            command = str(step.get("command") or step.get("cmd") or "")
+            local_path = str(step.get("localPath") or step.get("local_path") or "")
+            remote_path = str(step.get("remotePath") or step.get("remote_path") or "")
+            if kind == "remote" and not command.strip():
+                warnings.append(host["name"] + " 有空命令，已忽略")
+                continue
+            if kind in ("upload", "download") and (not local_path.strip() or not remote_path.strip()):
+                warnings.append(host["name"] + " 有缺少路径的传输步骤，已忽略")
+                continue
+            steps.append({
+                "kind": kind,
+                "note": str(step.get("note") or "")[:255],
+                "command": command,
+                "localPath": local_path,
+                "remotePath": remote_path,
+            })
+        if steps:
+            lines.append({"hostId": host_id, "hostName": host["name"], "steps": steps})
+    if not lines:
+        raise ValueError("没有生成可保存的步骤。" + (" ".join(warnings) if warnings else "请说明要复制到哪几台主机"))
+    return {"planId": plan_id, "summary": str(draft.get("summary") or ""), "warnings": warnings, "lines": lines}
+
+
 def session_user(token):
     if not token:
         return None
@@ -1130,6 +1285,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/users":
             return self.list_users()
+        if path == "/api/ai/config":
+            return self.send_json(read_ai_config())
         if path == "/api/state":
             return self.send_json(public_state(user))
         if path.startswith("/api/lines/"):
@@ -1198,6 +1355,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.copy_plan(payload)
             if path == "/api/line-flags":
                 return self.save_line_flag(payload)
+            if path == "/api/line-flags/all":
+                return self.set_all_lines(payload)
+            if path == "/api/ai/config":
+                return self.save_ai_config(payload)
+            if path == "/api/ai/draft":
+                return self.ai_draft(payload)
+            if path == "/api/ai/apply":
+                return self.ai_apply(payload)
+            if path == "/api/ai/undo":
+                return self.ai_undo(payload)
             if path == "/api/lines/copy":
                 return self.copy_line(payload)
             if path == "/api/steps/reorder":
@@ -1272,6 +1439,11 @@ class Handler(BaseHTTPRequestHandler):
                     (name, ip, port, username, identity, password or "", now()),
                 )
                 host_id = cur.lastrowid
+                plan_id = int(payload.get("planId") or 0)
+                if plan_id:
+                    if not can_plan(conn, self.user, plan_id):
+                        raise ValueError("没有这个画布的权限")
+                    conn.execute("INSERT IGNORE INTO plan_hosts (plan_id, host_id) VALUES (?, ?)", (plan_id, host_id))
         self.send_json({"id": host_id})
 
     def reorder_steps(self, payload):
@@ -1303,6 +1475,237 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("没有这个步骤")
             conn.execute("UPDATE steps SET disabled=? WHERE id=?", (disabled, step_id))
         self.send_json({"ok": True})
+
+    def save_ai_config(self, payload):
+        cfg = {
+            "base_url": str(payload.get("base_url") or "").strip(),
+            "api_key": str(payload.get("api_key") or "").strip(),
+            "model": str(payload.get("model") or "").strip(),
+            "timeout": max(10, int(payload.get("timeout") or 60)),
+        }
+        if not cfg["base_url"] or not cfg["api_key"] or not cfg["model"]:
+            raise ValueError("请填写接口地址、密钥和模型")
+        (DATA / "ai.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return self.send_json({"ok": True})
+
+    def disable_steps_draft(self, plan_id, prompt, hosts):
+        import re
+        if "禁用" not in prompt:
+            return None
+        number = re.search(r"(\d{3,})", prompt)
+        if not number:
+            raise ValueError("请写明要禁用哪台主机，例如 10069")
+        token = number.group(1)
+        matched = [host for host in hosts if token in host["name"] or token == str(host["ip"]) or token == str(host["port"])]
+        if len(matched) != 1:
+            raise ValueError("没有唯一匹配到包含 %s 的主机" % token)
+        host = matched[0]
+        phrase = re.search(r"的(.+)$", prompt)
+        title = phrase.group(1).strip() if phrase else ""
+        title = re.sub(r"(这个|该)?(命令|步骤)$", "", title).strip()
+        if not title:
+            raise ValueError("请写明要禁用哪一步，例如 拷贝模型文件")
+        with connect() as conn:
+            steps = rows(conn, "SELECT id, kind, note, command, local_path, remote_path, disabled FROM steps WHERE plan_id=? AND host_id=? ORDER BY position, id", (plan_id, host["id"]))
+        hits = [step for step in steps if title in (step["note"] or "") or title in (step["command"] or "") or title in (step["local_path"] or "")]
+        if not hits:
+            raise ValueError("%s 上没有找到「%s」" % (host["name"], title))
+        return {
+            "planId": plan_id,
+            "summary": "禁用 %s 的「%s」，不会新增步骤" % (host["name"], title),
+            "warnings": [],
+            "lines": [{
+                "action": "disable",
+                "hostId": host["id"],
+                "hostName": host["name"],
+                "steps": [{
+                    "id": step["id"],
+                    "kind": step["kind"],
+                    "note": step["note"] or "",
+                    "command": step["command"] or "",
+                    "localPath": step["local_path"] or "",
+                    "remotePath": step["remote_path"] or "",
+                } for step in hits],
+            }],
+        }
+
+    def copy_lines_draft(self, plan_id, prompt, hosts):
+        import re
+        index = chinese_index(prompt)
+        copies = chinese_count(prompt)
+        if not index or not copies:
+            return None
+        if index < 1 or index > len(hosts) or copies < 1:
+            raise ValueError("没有找到要复制的第 %d 条线" % index)
+        host = hosts[index - 1]
+        with connect() as conn:
+            steps = rows(conn, "SELECT kind, note, command, local_path, remote_path FROM steps WHERE plan_id=? AND host_id=? ORDER BY position, id", (plan_id, host["id"]))
+        if not steps:
+            raise ValueError("第 %d 条线上没有可复制的步骤" % index)
+        payload_steps = [{
+            "kind": step["kind"],
+            "note": step["note"] or "",
+            "command": step["command"] or "",
+            "localPath": step["local_path"] or "",
+            "remotePath": step["remote_path"] or "",
+        } for step in steps]
+        lines = []
+        for number in range(1, copies + 1):
+            lines.append({
+                "copyFromHostId": host["id"],
+                "hostName": "%s 副本%d" % (host["name"], number),
+                "steps": payload_steps,
+            })
+        return {
+            "planId": plan_id,
+            "summary": "将第%d条复制成 %d 条新线，保存后会出现在画布底部" % (index, copies),
+            "warnings": [],
+            "lines": lines,
+        }
+
+    def ai_draft(self, payload):
+        plan_id = int(payload.get("planId") or 0)
+        prompt = str(payload.get("prompt") or "").strip()
+        if not prompt:
+            raise ValueError("请先描述要生成的流水线")
+        if not can_plan_for(self.user, plan_id):
+            raise ValueError("没有这个画布的权限")
+        with connect() as conn:
+            hosts = rows(conn, """
+                SELECT hosts.id, hosts.name, hosts.ip, hosts.port, hosts.username
+                FROM hosts JOIN plan_hosts ON plan_hosts.host_id = hosts.id
+                WHERE plan_hosts.plan_id=? ORDER BY hosts.id
+            """, (plan_id,))
+        if not hosts:
+            raise ValueError("请先在这个项目里添加主机，再让 AI 起草")
+        disabled = self.disable_steps_draft(plan_id, prompt, hosts)
+        if disabled:
+            return self.send_json(disabled)
+        copied = self.copy_lines_draft(plan_id, prompt, hosts)
+        if copied:
+            return self.send_json(copied)
+        lines = []
+        with connect() as conn:
+            for index, host in enumerate(hosts, start=1):
+                steps = rows(
+                    conn,
+                    "SELECT position, kind, note, command, local_path, remote_path FROM steps WHERE plan_id=? AND host_id=? ORDER BY position, id",
+                    (plan_id, host["id"]),
+                )
+                brief = "；".join(
+                    (step["note"] or step["kind"]) + ":" + (step["command"] or (step["local_path"] + "->" + step["remote_path"]))[:40]
+                    for step in steps
+                ) or "暂无步骤"
+                lines.append("第%d条 hostId=%s %s %s@%s:%s 现有步骤：%s" % (index, host["id"], host["name"], host["username"], host["ip"], host["port"], brief))
+        host_text = "\n".join(lines)
+        system = (
+            "你是部署流水线起草助手。只输出 JSON，不要解释，不要建议执行。"
+            "JSON 包含 summary 和 lines。每条线包含 hostId 和 steps。"
+            "每个步骤包含 kind、note、command、localPath、remotePath。kind 只能是 remote、upload 或 download。"
+            "用户说第N条时，对应下面列表里的第N条，hostId 必须使用该条的 hostId。"
+            "复制整条流水线时不要追加到已有主机。输出 copyFromHostId 为源主机，并为每一份复制单独一条线。"
+            "remote 必须有 command。upload 和 download 必须有 localPath 与 remotePath。不要编造密码。"
+        )
+        text = ai_complete([
+            {"role": "system", "content": system},
+            {"role": "user", "content": "当前项目的线：\n" + host_text + "\n\n需求：\n" + prompt},
+        ])
+        draft = normalize_draft(plan_id, parse_ai_json(text), hosts)
+        return self.send_json(draft)
+
+    def ai_undo(self, payload):
+        change = _ai_undo.get(self.user["id"])
+        if not change:
+            raise ValueError("没有可撤回的 AI 保存")
+        plan_id = int(payload.get("planId") or change["planId"])
+        if plan_id != change["planId"] or not can_plan_for(self.user, plan_id):
+            raise ValueError("没有这个画布的权限")
+        with connect() as conn:
+            for step_id in change.get("enableStepIds") or []:
+                conn.execute("UPDATE steps SET disabled=0 WHERE id=? AND plan_id=?", (step_id, plan_id))
+            for step_id in change["stepIds"]:
+                conn.execute("DELETE FROM steps WHERE id=? AND plan_id=?", (step_id, plan_id))
+            for host_id in change["hostIds"]:
+                conn.execute("DELETE FROM steps WHERE plan_id=? AND host_id=?", (plan_id, host_id))
+                conn.execute("DELETE FROM plan_hosts WHERE plan_id=? AND host_id=?", (plan_id, host_id))
+                conn.execute("DELETE FROM hosts WHERE id=?", (host_id,))
+        _ai_undo.pop(self.user["id"], None)
+        return self.send_json({"ok": True})
+
+    def ai_apply(self, payload):
+        plan_id = int(payload.get("planId") or 0)
+        if not can_plan_for(self.user, plan_id):
+            raise ValueError("没有这个画布的权限")
+        lines = payload.get("lines") or []
+        if not lines:
+            raise ValueError("没有可保存的草稿")
+        saved = 0
+        created_hosts = []
+        created_steps = []
+        with connect() as conn:
+            for line in lines:
+                if line.get("action") == "disable":
+                    for step in line.get("steps") or []:
+                        step_id = int(step.get("id") or 0)
+                        row = conn.execute("SELECT id, disabled FROM steps WHERE id=? AND plan_id=?", (step_id, plan_id)).fetchone()
+                        if not row:
+                            raise ValueError("要禁用的步骤不存在")
+                        conn.execute("UPDATE steps SET disabled=1 WHERE id=?", (step_id,))
+                        created_steps.append(step_id)
+                        saved += 1
+                    continue
+                source_id = int(line.get("copyFromHostId") or 0)
+                if source_id:
+                    source = conn.execute("SELECT * FROM hosts WHERE id=?", (source_id,)).fetchone()
+                    if not source:
+                        raise ValueError("要复制的主机不存在")
+                    cur = conn.execute(
+                        """
+                        INSERT INTO hosts (name, ip, port, username, identity_file, password, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (str(line.get("hostName") or (source["name"] + " 副本")), source["ip"], source["port"], source["username"], source["identity_file"], source["password"], now()),
+                    )
+                    host_id = cur.lastrowid
+                    created_hosts.append(host_id)
+                    conn.execute("INSERT IGNORE INTO plan_hosts (plan_id, host_id) VALUES (?, ?)", (plan_id, host_id))
+                else:
+                    host_id = int(line.get("hostId") or 0)
+                    host = conn.execute("SELECT id, name FROM hosts WHERE id=?", (host_id,)).fetchone()
+                    if not host:
+                        raise ValueError("主机不存在")
+                for step in line.get("steps") or []:
+                    kind = step.get("kind")
+                    if kind not in ("remote", "upload", "download"):
+                        continue
+                    position = conn.execute(
+                        "SELECT COALESCE(MAX(position), 0) + 1 AS n FROM steps WHERE plan_id=? AND host_id=?",
+                        (plan_id, host_id),
+                    ).fetchone()["n"]
+                    cur = conn.execute(
+                        """
+                        INSERT INTO steps (plan_id, host_id, position, kind, command, local_path, remote_path, note)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            plan_id,
+                            host_id,
+                            position,
+                            kind,
+                            str(step.get("command") or ""),
+                            str(step.get("localPath") or ""),
+                            str(step.get("remotePath") or ""),
+                            str(step.get("note") or "")[:255],
+                        ),
+                    )
+                    saved += 1
+                    created_steps.append(cur.lastrowid)
+        if not saved:
+            raise ValueError("没有可保存的步骤")
+        undo_steps = [] if any(line.get("action") == "disable" for line in lines) else created_steps
+        undo_enable = created_steps if any(line.get("action") == "disable" for line in lines) else []
+        _ai_undo[self.user["id"]] = {"planId": plan_id, "hostIds": created_hosts, "stepIds": undo_steps, "enableStepIds": undo_enable}
+        return self.send_json({"ok": True, "saved": saved, "canUndo": True})
 
     def save_step(self, payload):
         plan_id = int(payload.get("planId") or 0)
@@ -1357,6 +1760,8 @@ class Handler(BaseHTTPRequestHandler):
             )
             new_id = cur.lastrowid
             grant_plan(conn, self.user["id"], new_id)
+            for row in conn.execute("SELECT host_id FROM plan_hosts WHERE plan_id=?", (plan_id,)).fetchall():
+                conn.execute("INSERT IGNORE INTO plan_hosts (plan_id, host_id) VALUES (?, ?)", (new_id, row["host_id"]))
             steps = conn.execute("SELECT * FROM steps WHERE plan_id=? ORDER BY position, id", (plan_id,)).fetchall()
             for step in steps:
                 conn.execute(
@@ -1391,6 +1796,7 @@ class Handler(BaseHTTPRequestHandler):
                 (host["name"] + " 副本", host["ip"], host["port"], host["username"], host["identity_file"], host["password"], now()),
             )
             new_host_id = cur.lastrowid
+            conn.execute("INSERT IGNORE INTO plan_hosts (plan_id, host_id) VALUES (?, ?)", (plan_id, new_host_id))
             steps = conn.execute(
                 "SELECT * FROM steps WHERE plan_id=? AND host_id=? ORDER BY position, id",
                 (plan_id, host_id),
@@ -1413,6 +1819,25 @@ class Handler(BaseHTTPRequestHandler):
                     (plan_id, new_host_id, flag["disabled"]),
                 )
         self.send_json({"id": new_host_id})
+
+    def set_all_lines(self, payload):
+        plan_id = int(payload.get("planId") or 0)
+        disabled = 1 if payload.get("disabled", True) else 0
+        if not can_plan_for(self.user, plan_id):
+            raise ValueError("没有这个画布的权限")
+        with connect() as conn:
+            hosts = rows(conn, "SELECT host_id FROM plan_hosts WHERE plan_id=?", (plan_id,))
+            if not hosts:
+                raise ValueError("这个项目还没有流水线")
+            for row in hosts:
+                conn.execute(
+                    """
+                    INSERT INTO line_flags (plan_id, host_id, disabled, force_run) VALUES (?, ?, ?, 0)
+                    ON DUPLICATE KEY UPDATE disabled=VALUES(disabled)
+                    """,
+                    (plan_id, row["host_id"], disabled),
+                )
+        return self.send_json({"ok": True, "count": len(hosts)})
 
     def save_line_flag(self, payload):
         plan_id = int(payload.get("planId") or 0)
@@ -1611,6 +2036,7 @@ class Handler(BaseHTTPRequestHandler):
                 host_id = int(parts[2])
                 with connect() as conn:
                     conn.execute("DELETE FROM steps WHERE host_id=?", (host_id,))
+                    conn.execute("DELETE FROM plan_hosts WHERE host_id=?", (host_id,))
                     conn.execute("DELETE FROM hosts WHERE id=?", (host_id,))
                 return self.send_json({"ok": True})
             if len(parts) == 3 and parts[0] == "api" and parts[1] == "users":
@@ -1624,6 +2050,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not self.user.get("is_admin") and plan["owner_id"] != self.user["id"]:
                         return self.send_json({"error": "只能删除自己创建的画布"}, 403)
                     conn.execute("DELETE FROM steps WHERE plan_id=?", (plan_id,))
+                    conn.execute("DELETE FROM line_flags WHERE plan_id=?", (plan_id,))
                     conn.execute("DELETE FROM plan_access WHERE plan_id=?", (plan_id,))
                     conn.execute("DELETE FROM plans WHERE id=?", (plan_id,))
                 return self.send_json({"ok": True})

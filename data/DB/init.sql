@@ -105,3 +105,9 @@ SELECT 'admin',
 FROM DUAL
 WHERE NOT EXISTS (SELECT 1 FROM users WHERE username = 'admin');
 
+CREATE TABLE IF NOT EXISTS plan_hosts (
+  plan_id BIGINT NOT NULL,
+  host_id BIGINT NOT NULL,
+  PRIMARY KEY (plan_id, host_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
