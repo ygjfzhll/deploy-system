@@ -94,3 +94,13 @@ CREATE TABLE IF NOT EXISTS plan_access (
   PRIMARY KEY (user_id, plan_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- 默认管理员。仅当不存在 admin 时插入。
+-- 用户名 admin，密码 admin。程序启动时如果用户表为空，也会创建同一账号。
+INSERT INTO users (username, password_hash, created_at, is_admin)
+SELECT 'admin',
+       'pbkdf2_sha256$120000$18e2bda917d31093fe1d70399cc6278b$0e244819c0418599fcf5fdf0450176d30acb76a5ce1b9e7b8a59f3e6419425c8',
+       '2026-11-11 00:00:00',
+       1
+FROM DUAL
+WHERE NOT EXISTS (SELECT 1 FROM users WHERE username = 'admin');
+
