@@ -1286,6 +1286,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/users":
             return self.list_users()
         if path == "/api/ai/config":
+            if not user.get("is_admin"):
+                return self.send_json({"error": "只有管理员可以配置 AI"}, 403)
             return self.send_json(read_ai_config())
         if path == "/api/state":
             return self.send_json(public_state(user))
@@ -1477,6 +1479,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"ok": True})
 
     def save_ai_config(self, payload):
+        if not self.user.get("is_admin"):
+            return self.send_json({"error": "只有管理员可以配置 AI"}, 403)
         cfg = {
             "base_url": str(payload.get("base_url") or "").strip(),
             "api_key": str(payload.get("api_key") or "").strip(),

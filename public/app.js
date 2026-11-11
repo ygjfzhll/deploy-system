@@ -50,6 +50,7 @@ function showApp(user) {
   document.querySelector("#who").textContent = user.username;
   document.querySelector("#login-error").textContent = "";
   document.querySelector("#manage-users").hidden = !user.isAdmin;
+  document.querySelector("#ai-config").hidden = !user.isAdmin;
 }
 
 function currentPlan() {
